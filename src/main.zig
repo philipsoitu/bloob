@@ -4,6 +4,7 @@ const cli_mod = @import("cli.zig");
 const term = @import("term.zig");
 const app_mod = @import("app.zig");
 const headless = @import("headless.zig");
+const sessions_store = @import("sessions/store.zig");
 
 const version = "0.1.0";
 const lua_version = "LuaJIT 2.1";
@@ -188,7 +189,7 @@ pub fn main(process_init: std.process.Init) !u8 {
         return 0;
     }
     if (cli.list_sessions) {
-        try writeStdout(process_init, "No sessions yet (session persistence is the next milestone).\n");
+        try listSessions(process_init);
         return 0;
     }
     if (cli.doctor) {
@@ -228,6 +229,7 @@ pub fn main(process_init: std.process.Init) !u8 {
     });
     defer app.deinit();
     app.initLua(cli.config, cli.no_config);
+    app.initSessions(cli.session, cli.resume_session);
     app.run() catch |err| {
         terminal.deinit();
         var buf: [4096]u8 = undefined;
@@ -238,4 +240,48 @@ pub fn main(process_init: std.process.Init) !u8 {
     };
     terminal.deinit();
     return 0;
+}
+
+fn listSessions(init: std.process.Init) !void {
+    const dir = sessions_store.defaultDataDir(init.gpa, init.environ_map) catch |err| {
+        var buf: [4096]u8 = undefined;
+        var w = stdoutWriter(init, &buf);
+        try w.interface.print("bloob: session storage unavailable: {s}\n", .{@errorName(err)});
+        try w.interface.flush();
+        return;
+    };
+    defer init.gpa.free(dir);
+    var store = sessions_store.Store.init(init.gpa, init.io, dir) catch |err| {
+        var buf: [4096]u8 = undefined;
+        var w = stdoutWriter(init, &buf);
+        try w.interface.print("bloob: session storage unavailable: {s}\n", .{@errorName(err)});
+        try w.interface.flush();
+        return;
+    };
+    defer store.deinit();
+    const infos = store.list() catch |err| {
+        var buf: [4096]u8 = undefined;
+        var w = stdoutWriter(init, &buf);
+        try w.interface.print("bloob: cannot list sessions: {s}\n", .{@errorName(err)});
+        try w.interface.flush();
+        return;
+    };
+    defer sessions_store.freeInfoList(init.gpa, infos);
+    var buf: [8192]u8 = undefined;
+    var w = stdoutWriter(init, &buf);
+    if (infos.len == 0) {
+        try w.interface.writeAll("No saved sessions.\n");
+    } else {
+        try w.interface.writeAll("ID                              UPDATED(ms)      MESSAGES  MODEL                     CWD\n");
+        for (infos) |info| {
+            try w.interface.print("{s:<31} {d:<15} {d:<9} {s:<24} {s}\n", .{
+                info.id,
+                @as(u64, @intCast(info.updated_ms)),
+                info.message_count,
+                info.model,
+                info.cwd,
+            });
+        }
+    }
+    try w.interface.flush();
 }

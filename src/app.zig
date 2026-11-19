@@ -18,6 +18,8 @@ const provider_stream = @import("providers/stream.zig");
 const provider_registry = @import("providers/registry.zig");
 const provider_request = @import("providers/request.zig");
 const prompts = @import("agent/prompts.zig");
+const sessions_store = @import("sessions/store.zig");
+const sessions_compat = @import("sessions/compat.zig");
 const env = @import("env.zig");
 
 const Frame = frame_mod.Frame;
@@ -162,6 +164,10 @@ pub const App = struct {
     last_tool_summary: []u8 = &.{},
     provider_stream: ?*provider_stream.Stream = null,
     provider_emit_pos: usize = 0,
+    session_store: ?sessions_store.Store = null,
+    session: ?sessions_store.Session = null,
+    persisted_count: usize = 0,
+    persistence_enabled: bool = true,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, terminal: *term.Terminal, opts: struct {
         model: ?[]const u8 = null,
@@ -193,6 +199,124 @@ pub const App = struct {
         return self;
     }
 
+    pub fn initSessions(self: *App, explicit_id: ?[]const u8, resume_latest: bool) void {
+        const base = env.get("XDG_DATA_HOME") orelse blk: {
+            if (env.get("HOME")) |h| break :blk std.fmt.allocPrint(self.gpa, "{s}/.local/share", .{h}) catch return;
+            self.notify("Session storage unavailable: HOME/XDG_DATA_HOME unset", true);
+            self.persistence_enabled = false;
+            return;
+        };
+        defer if (env.get("XDG_DATA_HOME") == null) {
+            if (env.get("HOME") != null) self.gpa.free(base);
+        };
+        const dir = std.fmt.allocPrint(self.gpa, "{s}/bloob/sessions", .{base}) catch return;
+        defer self.gpa.free(dir);
+        var store = sessions_store.Store.init(self.gpa, self.io, dir) catch |err| {
+            const msg = std.fmt.allocPrint(self.gpa, "Session storage unavailable: {s}", .{@errorName(err)}) catch "Session storage unavailable";
+            defer self.gpa.free(msg);
+            self.notify(msg, true);
+            self.persistence_enabled = false;
+            return;
+        };
+        self.session_store = store;
+        var loaded: ?sessions_store.Session = null;
+        if (explicit_id) |id| {
+            loaded = store.load(id) catch |err| blk: {
+                const msg = std.fmt.allocPrint(self.gpa, "Cannot resume session {s}: {s}", .{ id, @errorName(err) }) catch "Cannot resume session";
+                defer self.gpa.free(msg);
+                self.notify(msg, true);
+                break :blk null;
+            };
+        } else if (resume_latest) {
+            const infos = store.list() catch null;
+            if (infos) |list| {
+                defer sessions_store.freeInfoList(self.gpa, list);
+                if (list.len > 0) {
+                    loaded = store.load(list[0].id) catch null;
+                }
+            }
+        }
+        if (loaded) |session| {
+            self.applyLoadedSession(session);
+        } else {
+            self.createNewSession();
+        }
+    }
+
+    fn applyLoadedSession(self: *App, session: sessions_store.Session) void {
+        var loaded = session;
+        const native = sessions_compat.conversationToNative(self.gpa, &loaded.conversation) catch {
+            loaded.deinit();
+            self.notify("Failed to load session conversation", true);
+            self.createNewSession();
+            return;
+        };
+        self.conversation.deinit();
+        self.conversation = native;
+        self.persisted_count = self.conversation.messages.items.len;
+        for (self.conversation.messages.items) |*m| m.streaming = false;
+        self.setSessionId(loaded.id);
+        if (loaded.model.len > 0) self.setModel(loaded.model);
+        self.chat_scroll = 0;
+        self.stick_bottom = true;
+        if (self.session) |*old| old.deinit();
+        self.session = loaded;
+        self.notify("Session resumed", false);
+        self.dirty = true;
+    }
+
+    fn setSessionId(self: *App, id: []const u8) void {
+        const owned = self.gpa.dupe(u8, id) catch return;
+        if (self.session_id.len > 0) self.gpa.free(self.session_id);
+        self.session_id = owned;
+    }
+
+    pub fn createNewSession(self: *App) void {
+        const store = if (self.session_store) |*s| s else {
+            self.notify("Session storage unavailable", true);
+            return;
+        };
+        const new_session = store.create(self.workspaceRoot(), self.model) catch |err| {
+            const msg = std.fmt.allocPrint(self.gpa, "Cannot create session: {s}", .{@errorName(err)}) catch "Cannot create session";
+            defer self.gpa.free(msg);
+            self.notify(msg, true);
+            return;
+        };
+        if (self.session) |*old| old.deinit();
+        self.setSessionId(new_session.id);
+        self.session = new_session;
+        self.persisted_count = 0;
+        self.dirty = true;
+    }
+
+    fn persistPendingMessages(self: *App) void {
+        if (!self.persistence_enabled) return;
+        const store = if (self.session_store) |*s| s else return;
+        const session = if (self.session) |*s| s else return;
+        var failures: u8 = 0;
+        while (self.persisted_count < self.conversation.messages.items.len) {
+            const msg = &self.conversation.messages.items[self.persisted_count];
+            if (msg.streaming) break;
+            var converted = sessions_compat.fromNative(self.gpa, msg) catch break;
+            defer converted.deinit(self.gpa);
+            store.appendMessage(session, &converted) catch |err| {
+                failures += 1;
+                if (failures == 1) {
+                    const persist_msg = std.fmt.allocPrint(self.gpa, "Failed to persist session: {s}", .{@errorName(err)}) catch "Failed to persist session";
+                    defer self.gpa.free(persist_msg);
+                    self.notify(persist_msg, true);
+                }
+                break;
+            };
+            self.persisted_count += 1;
+        }
+    }
+
+    fn updateSessionMeta(self: *App) void {
+        const store = if (self.session_store) |*s| s else return;
+        const session = if (self.session) |*s| s else return;
+        store.updateMeta(session) catch {};
+    }
     pub fn initLua(self: *App, explicit_config: ?[]const u8, no_config: bool) void {
         var path: ?[]u8 = null;
         var explicit = false;
@@ -359,6 +483,8 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        if (self.session) |*s| s.deinit();
+        if (self.session_store) |*s| s.deinit();
         if (self.provider_stream) |s| s.deinit();
         if (self.approval) |*a| a.deinit(self.gpa);
         for (self.pending_tools.items) |*p| p.deinit(self.gpa);
@@ -411,6 +537,7 @@ pub const App = struct {
             }
             _ = try self.conversation.add(.assistant, "Welcome to **bloob**, a Lua-programmable coding agent.\n\nType a message and press Enter. Try `/help`.\n\nThe deterministic `mock/fixture` provider is active, so no API key is required.\n\n```zig\nconst bloob = @import(\"bloob\");\n```\n", self.nowMs());
         }
+        self.persistPendingMessages();
         self.size = self.terminal.size();
         try self.resize();
         var read_buf: [8192]u8 = undefined;
@@ -529,6 +656,7 @@ pub const App = struct {
         }
         if (self.mock_tool) |*m| m.deinit(self.gpa);
         self.mock_tool = null;
+        self.persistPendingMessages();
         if (tool_proposed) {
             self.agent_phase = .executing_tools;
             self.beginToolLoop();
@@ -920,6 +1048,7 @@ pub const App = struct {
             return;
         }
         _ = try self.conversation.add(.user, value, self.nowMs());
+        self.persistPendingMessages();
         self.chat_scroll = 0;
         self.stick_bottom = true;
         if (self.mock_mode) {
@@ -1126,6 +1255,7 @@ pub const App = struct {
             self.appendToolMessage(call, "Unknown tool", true);
         }
         self.tool_index += 1;
+        self.persistPendingMessages();
         self.processNextTool();
     }
 
@@ -1147,6 +1277,7 @@ pub const App = struct {
         defer if (safe.len > 0) self.gpa.free(safe);
         const m = self.conversation.add(.tool, safe, self.nowMs()) catch return;
         m.setToolResult(self.gpa, call.id, call.name, is_error) catch {};
+        self.persistPendingMessages();
         self.dirty = true;
     }
 
@@ -1164,6 +1295,7 @@ pub const App = struct {
             const msg = std.fmt.allocPrint(self.gpa, "Fixture tool loop complete. {s}\n\nThe result is shown above. No model was contacted; this is the deterministic offline fixture.", .{summary}) catch "Fixture tool loop complete.";
             defer self.gpa.free(msg);
             _ = self.conversation.add(.assistant, msg, self.nowMs()) catch {};
+            self.persistPendingMessages();
             self.agent_phase = .idle;
             self.dirty = true;
             return;
@@ -1499,11 +1631,32 @@ pub const App = struct {
         } else if (std.mem.eql(u8, name, "quit") or std.mem.eql(u8, name, "q")) {
             self.running = false;
         } else if (std.mem.eql(u8, name, "clear")) {
-            self.conversation.clear();
-            self.chat_scroll = 0;
-            self.notify("Conversation cleared", false);
-        } else if (std.mem.eql(u8, name, "new") or std.mem.eql(u8, name, "session")) {
-            if (std.mem.eql(u8, args, "new") or name.len == 3) self.newConversation() else self.notify("Session persistence is coming next", false);
+            self.newConversation();
+        } else if (std.mem.eql(u8, name, "new")) {
+            self.newConversation();
+        } else if (std.mem.eql(u8, name, "session")) {
+            if (args.len == 0 or std.mem.eql(u8, args, "list")) {
+                const count = if (self.session_store) |*s| blk: {
+                    const infos = s.list() catch break :blk @as(usize, 0);
+                    const n = infos.len;
+                    sessions_store.freeInfoList(self.gpa, infos);
+                    break :blk n;
+                } else 0;
+                if (count == 0) self.notify("No saved sessions", false) else self.notify("Saved sessions available; use --list-sessions for details", false);
+            } else if (std.mem.eql(u8, args, "new")) {
+                self.newConversation();
+            } else if (std.mem.startsWith(u8, args, "resume ")) {
+                const id = std.mem.trim(u8, args["resume ".len..], " ");
+                if (self.session_store) |*s| {
+                    const loaded = s.load(id) catch {
+                        self.notify("Session not found", true);
+                        return;
+                    };
+                    self.applyLoadedSession(loaded);
+                }
+            } else {
+                self.notify("Usage: /session list | new | resume ID", false);
+            }
         } else if (std.mem.eql(u8, name, "theme")) {
             if (args.len == 0) {
                 self.notify("Themes: default, light, monochrome, catppuccin", false);
@@ -1548,12 +1701,13 @@ pub const App = struct {
 
     fn newConversation(self: *App) void {
         self.conversation.clear();
+        self.createNewSession();
         _ = self.conversation.add(.system, "New conversation", self.nowMs()) catch return;
+        self.persistPendingMessages();
         self.chat_scroll = 0;
         self.stick_bottom = true;
         self.notify("New conversation", false);
     }
-
     fn openPalette(self: *App) void {
         self.palette.active = true;
         self.palette.query.clearRetainingCapacity();

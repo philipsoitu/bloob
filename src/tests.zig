@@ -16,4 +16,6 @@ test {
     _ = @import("providers/request.zig");
     _ = @import("providers/registry.zig");
     _ = @import("headless.zig");
+    _ = @import("sessions/store.zig");
+    _ = @import("sessions/compat.zig");
 }
