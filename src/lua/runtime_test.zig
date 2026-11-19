@@ -294,3 +294,36 @@ test "lua keymap callback invocation" {
     }
     try std.testing.expectEqualStrings("callback fired", host.notified.items);
 }
+
+test "config loads and can require modules from config directory" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "helper.lua", .data = "return { value = 'from-helper' }\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "init.lua", .data =
+        \\local helper = require("helper")
+        \\local ui = require("bloob.ui")
+        \\ui.register("cfg.test", function(ctx) return ui.text(helper.value) end)
+        \\ui.set_layout(ui.column({ ui.widget("cfg.test") }))
+        \\
+    });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &path_buf);
+    const init_path = try std.fs.path.join(gpa, &.{ path_buf[0..n], "init.lua" });
+    defer gpa.free(init_path);
+    var host = TestHost{};
+    defer host.notified.deinit(gpa);
+    defer host.model.deinit(gpa);
+    defer host.theme.deinit(gpa);
+    const rt = try runtime_mod.Runtime.init(gpa, io, host.host());
+    defer rt.deinit();
+    try rt.loadConfig(init_path);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const layout = try rt.buildLayout(arena.allocator(), .{ .width = 80, .height = 20 });
+    try std.testing.expectEqual(ui.Kind.column, layout.kind);
+    try std.testing.expectEqualStrings("from-helper", layout.children[0].content.?);
+}

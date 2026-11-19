@@ -80,6 +80,7 @@ pub const commands = [_]Command{
     .{ .name = "files", .description = "Toggle the file sidebar" },
     .{ .name = "diff", .description = "Show pending diff (when available)" },
     .{ .name = "tools", .description = "List registered tools and policy" },
+    .{ .name = "plugins", .description = "List loaded Lua plugins" },
     .{ .name = "theme", .description = "List or switch themes" },
     .{ .name = "reload", .description = "Reload Lua configuration" },
     .{ .name = "keymaps", .description = "Inspect keymaps" },
@@ -168,6 +169,9 @@ pub const App = struct {
     session: ?sessions_store.Session = null,
     persisted_count: usize = 0,
     persistence_enabled: bool = true,
+    safe_mode: bool = false,
+    config_disabled: bool = false,
+    plugins_loaded: std.ArrayList([]u8) = .empty,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, terminal: *term.Terminal, opts: struct {
         model: ?[]const u8 = null,
@@ -318,7 +322,9 @@ pub const App = struct {
         const session = if (self.session) |*s| s else return;
         store.updateMeta(session) catch {};
     }
-    pub fn initLua(self: *App, explicit_config: ?[]const u8, no_config: bool) void {
+    pub fn initLua(self: *App, explicit_config: ?[]const u8, no_config: bool, safe_mode: bool) void {
+        self.safe_mode = safe_mode;
+        self.config_disabled = no_config;
         var path: ?[]u8 = null;
         var explicit = false;
         if (!no_config) {
@@ -372,6 +378,7 @@ pub const App = struct {
                 srcs.appendSlice(self.gpa, s) catch {};
             }
             if (srcs.items.len > 0) self.notify("Loaded config", false);
+            self.loadPlugins(rt);
         }
         self.dirty = true;
         if (self.lua) |l| _ = l.emit("config.loaded", "{}");
@@ -405,6 +412,14 @@ pub const App = struct {
         self.model = owned;
         self.provider = provider_owned;
         self.mock_mode = std.mem.startsWith(u8, self.provider, "mock") or std.mem.startsWith(u8, self.provider, "fixture");
+        if (self.session) |*s| {
+            if (self.session_store) |*store| {
+                const m = self.gpa.dupe(u8, self.model) catch return;
+                self.gpa.free(s.model);
+                s.model = m;
+                store.updateMeta(s) catch {};
+            }
+        }
         self.dirty = true;
     }
 
@@ -451,6 +466,7 @@ pub const App = struct {
         if (old_model) |m| self.gpa.free(m);
         if (self.lua) |old| old.deinit();
         self.lua = candidate;
+        self.loadPlugins(candidate);
         self.focus_buttons.clearRetainingCapacity();
         self.buttons.clearRetainingCapacity();
         self.focus_index = 0;
@@ -491,6 +507,8 @@ pub const App = struct {
 
     pub fn deinit(self: *App) void {
         if (self.session) |*s| s.deinit();
+        for (self.plugins_loaded.items) |p| self.gpa.free(p);
+        self.plugins_loaded.deinit(self.gpa);
         if (self.session_store) |*s| s.deinit();
         if (self.provider_stream) |s| s.deinit();
         if (self.approval) |*a| a.deinit(self.gpa);
@@ -1500,6 +1518,14 @@ pub const App = struct {
         const finish = s.acc.finish_reason;
         _ = finish;
         if (err) |e| {
+            if (self.stream_msg_index) |idx| {
+                if (idx < self.conversation.messages.items.len) {
+                    const am = &self.conversation.messages.items[idx];
+                    for (am.tool_calls.items) |*tc| tc.deinit(self.gpa);
+                    am.tool_calls.clearRetainingCapacity();
+                    had_tools = false;
+                }
+            }
             const msg = std.fmt.allocPrint(self.gpa, "Provider error: {s}", .{e}) catch "Provider error";
             defer self.gpa.free(msg);
             self.notify(msg, true);
@@ -1507,6 +1533,7 @@ pub const App = struct {
         self.stream_msg_index = null;
         self.provider_emit_pos = 0;
         s.deinit();
+        self.persistPendingMessages();
         if (err != null) {
             self.agent_phase = .failed;
         } else if (had_tools) {
@@ -1540,6 +1567,7 @@ pub const App = struct {
         }
         self.stream_msg_index = null;
         self.provider_emit_pos = 0;
+        self.persistPendingMessages();
         self.agent_phase = .cancelled;
         self.dirty = true;
         return true;
@@ -1725,9 +1753,66 @@ pub const App = struct {
                 self.notify("Active model", false);
             }
         } else if (std.mem.eql(u8, name, "providers")) {
-            self.notify("mock/fixture: ready; openai: key check pending", false);
+            var buf = std.ArrayList(u8).empty;
+            defer buf.deinit(self.gpa);
+            const openai = if (env.get("OPENAI_API_KEY") != null) "configured" else "missing OPENAI_API_KEY";
+            const anthropic = if (env.get("ANTHROPIC_API_KEY") != null) "configured" else "missing ANTHROPIC_API_KEY";
+            const compat = if (env.get("BLOOB_COMPAT_BASE_URL") != null) "configured" else "missing BLOOB_COMPAT_BASE_URL";
+            appendFmt(self.gpa, &buf, "mock/fixture: ready\nopenai: {s}\nanthropic: {s}\ncompat: {s}\n", .{ openai, anthropic, compat }) catch {};
+            self.appendSystemMessage(buf.items);
+        } else if (std.mem.eql(u8, name, "plugins")) {
+            var buf = std.ArrayList(u8).empty;
+            defer buf.deinit(self.gpa);
+            if (self.plugins_loaded.items.len == 0) {
+                buf.appendSlice(self.gpa, "No plugins loaded.") catch {};
+            } else {
+                buf.appendSlice(self.gpa, "Loaded plugins:\n") catch {};
+                for (self.plugins_loaded.items) |p| {
+                    appendFmt(self.gpa, &buf, "  {s}\n", .{p}) catch {};
+                }
+            }
+            self.appendSystemMessage(buf.items);
         } else if (std.mem.eql(u8, name, "tools")) {
-            self.notify("Tools: read_file, list_files, search, edit_file, write_file, shell, git_status, git_diff (runtime wiring next)", false);
+            var buf = std.ArrayList(u8).empty;
+            defer buf.deinit(self.gpa);
+            buf.appendSlice(self.gpa, "Built-in tools:\n") catch {};
+            for (&tools.defs) |*d| {
+                const line = std.fmt.allocPrint(self.gpa, "  {s} — {s}\n", .{ d.name, d.description }) catch continue;
+                defer self.gpa.free(line);
+                buf.appendSlice(self.gpa, line) catch {};
+            }
+            if (self.lua) |l| {
+                if (l.tools.items.len > 0) {
+                    buf.appendSlice(self.gpa, "Lua tools:\n") catch {};
+                    for (l.tools.items) |t| {
+                        const line = std.fmt.allocPrint(self.gpa, "  {s} — {s}\n", .{ t.name, t.description }) catch continue;
+                        defer self.gpa.free(line);
+                        buf.appendSlice(self.gpa, line) catch {};
+                    }
+                }
+            }
+            self.appendSystemMessage(buf.items);
+        } else if (std.mem.eql(u8, name, "context")) {
+            const usage = self.conversation.totalUsage();
+            const msg = std.fmt.allocPrint(self.gpa, "Workspace: {s}\nSession: {s}\nModel: {s}\nMessages: {d}\nTokens: {d}\nTools: {d} built-in, {d} Lua", .{
+                self.workspaceRoot(),
+                self.session_id,
+                self.model,
+                self.conversation.messages.items.len,
+                usage.total(),
+                tools.defs.len,
+                if (self.lua) |l| l.tools.items.len else 0,
+            }) catch return;
+            defer self.gpa.free(msg);
+            self.appendSystemMessage(msg);
+        } else if (std.mem.eql(u8, name, "diff")) {
+            const ctx = self.toolContext() orelse {
+                self.notify("Workspace unavailable", true);
+                return;
+            };
+            var res = tools.execute(ctx, "git_diff", "{\"max_bytes\":65536}");
+            defer res.deinit(self.gpa);
+            self.appendSystemMessage(res.content);
         } else if (std.mem.eql(u8, name, "files")) {
             self.show_sidebar = !self.show_sidebar;
             self.notify(if (self.show_sidebar) "Sidebar shown" else "Sidebar hidden", false);
@@ -1738,7 +1823,7 @@ pub const App = struct {
             self.help.scroll = 0;
             self.notify("Doctor: see help overlay", false);
         } else if (std.mem.eql(u8, name, "export")) {
-            self.notify("Session persistence is coming next", false);
+            self.exportSession(args);
         } else {
             if (self.lua) |l| {
                 if (l.runCommand(name, args)) {
@@ -2331,6 +2416,102 @@ pub const App = struct {
         }
     }
 
+    fn appendSystemMessage(self: *App, msg: []const u8) void {
+        const safe = text.sanitizeAlloc(self.gpa, msg, 256 * 1024) catch self.gpa.dupe(u8, "message unavailable") catch return;
+        defer if (safe.len > 0) self.gpa.free(safe);
+        _ = self.conversation.add(.system, safe, self.nowMs()) catch return;
+        self.persistPendingMessages();
+        self.stick_bottom = true;
+        self.chat_scroll = 0;
+        self.dirty = true;
+    }
+
+    fn exportSession(self: *App, args: []const u8) void {
+        const ws = if (self.workspace) |*w| w else {
+            self.notify("Workspace unavailable", true);
+            return;
+        };
+        const default_name = std.fmt.allocPrint(self.gpa, "bloob-session-{s}.md", .{self.session_id}) catch "bloob-session.md";
+        defer self.gpa.free(default_name);
+        const requested = std.mem.trim(u8, args, " ");
+        const rel = if (requested.len > 0) requested else default_name;
+        const abs = ws.resolveWrite(rel) catch |err| {
+            self.notify(@errorName(err), true);
+            return;
+        };
+        defer self.gpa.free(abs);
+        var out = std.ArrayList(u8).empty;
+        defer out.deinit(self.gpa);
+        appendFmt(self.gpa, &out, "# bloob session {s}\n\nWorkspace: `{s}`\n\n", .{ self.session_id, self.workspaceRoot() }) catch {};
+        for (self.conversation.messages.items) |*m| {
+            const role = switch (m.role) {
+                .system => "system",
+                .user => "user",
+                .assistant => "assistant",
+                .tool => "tool",
+            };
+            appendFmt(self.gpa, &out, "## {s}\n\n", .{role}) catch {};
+            out.appendSlice(self.gpa, m.text.items) catch {};
+            out.appendSlice(self.gpa, "\n\n") catch {};
+            for (m.tool_calls.items) |tc| {
+                appendFmt(self.gpa, &out, "Tool call `{s}`:\n\n```json\n{s}\n```\n\n", .{ tc.name, tc.args }) catch {};
+            }
+            if (m.role == .tool) {
+                appendFmt(self.gpa, &out, "Tool: `{s}` (error: {s})\n\n", .{ m.tool_name orelse "", if (m.tool_is_error) "yes" else "no" }) catch {};
+            }
+        }
+        std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = abs, .data = out.items }) catch |err| {
+            self.notify(@errorName(err), true);
+            return;
+        };
+        const msg = std.fmt.allocPrint(self.gpa, "Exported to {s}", .{ws.relative(abs)}) catch "Exported";
+        defer self.gpa.free(msg);
+        self.notify(msg, false);
+    }
+
+    fn configBaseDir(self: *App) ?[]u8 {
+        if (self.lua_config_path) |p| {
+            const dir = std.fs.path.dirname(p) orelse ".";
+            return self.gpa.dupe(u8, dir) catch null;
+        }
+        if (env.get("XDG_CONFIG_HOME")) |xdg| return std.fmt.allocPrint(self.gpa, "{s}/bloob", .{xdg}) catch null;
+        if (env.get("HOME")) |home| return std.fmt.allocPrint(self.gpa, "{s}/.config/bloob", .{home}) catch null;
+        return null;
+    }
+
+    fn loadPlugins(self: *App, rt: *lua_runtime.Runtime) void {
+        for (self.plugins_loaded.items) |p| self.gpa.free(p);
+        self.plugins_loaded.clearRetainingCapacity();
+        if (self.safe_mode or self.config_disabled) return;
+        const base = self.configBaseDir() orelse return;
+        defer self.gpa.free(base);
+        const plugins_dir = std.fs.path.join(self.gpa, &.{ base, "plugins" }) catch return;
+        defer self.gpa.free(plugins_dir);
+        var dir = std.Io.Dir.cwd().openDir(self.io, plugins_dir, .{ .iterate = true }) catch return;
+        defer dir.close(self.io);
+        var it = dir.iterate();
+        var loaded: usize = 0;
+        while (it.next(self.io) catch null) |entry| {
+            if (entry.kind != .directory) continue;
+            const plugin_path = std.fs.path.join(self.gpa, &.{ plugins_dir, entry.name, "plugin.lua" }) catch continue;
+            defer self.gpa.free(plugin_path);
+            std.Io.Dir.cwd().access(self.io, plugin_path, .{}) catch continue;
+            lua_runtime.executeFile(rt, plugin_path) catch {
+                const msg = std.fmt.allocPrint(self.gpa, "Plugin {s} failed: {s}", .{ entry.name, rt.lastError() }) catch "Plugin failed";
+                defer self.gpa.free(msg);
+                self.notify(msg, true);
+                continue;
+            };
+            self.plugins_loaded.append(self.gpa, self.gpa.dupe(u8, entry.name) catch continue) catch continue;
+            loaded += 1;
+        }
+        if (loaded > 0) {
+            const msg = std.fmt.allocPrint(self.gpa, "Loaded {d} plugin(s)", .{loaded}) catch "Plugins loaded";
+            defer self.gpa.free(msg);
+            self.notify(msg, false);
+        }
+    }
+
     fn emitSessionEvent(self: *App, name: []const u8) void {
         const l = self.lua orelse return;
         const id_esc = self.jsonInnerDup(self.session_id) catch return;
@@ -2497,4 +2678,10 @@ fn luaToolCapability(gpa: std.mem.Allocator, permissions_json: []const u8) permi
     if (saw_shell) return .shell;
     if (saw_read) return .workspace_read;
     return .custom;
+}
+
+fn appendFmt(gpa: std.mem.Allocator, out: *std.ArrayList(u8), comptime fmt: []const u8, args: anytype) !void {
+    const s = try std.fmt.allocPrint(gpa, fmt, args);
+    defer gpa.free(s);
+    try out.appendSlice(gpa, s);
 }

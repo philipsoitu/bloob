@@ -726,20 +726,41 @@ pub const Runtime = struct {
             const kind_s = util.fieldString(L, idx, "__bloob") orelse "";
             const kind = nodeKindFromString(kind_s) orelse return error.UnknownNodeKind;
             // Widgets are expanded by calling the registered Lua component.
-            if (kind == .custom) {
+            if (kind == .custom or kind == .widget) {
                 const name = util.fieldString(L, idx, "name") orelse return error.WidgetMissingName;
-                const n = self.rt.renderWidget(self.arena, name, self.ctx, depth) catch |err| {
+                const child = self.rt.renderWidget(self.arena, name, self.ctx, depth) catch |err| {
                     self.error_message = self.rt.lastError();
                     return err;
                 };
-                return n;
-            }
-            if (kind == .widget) {
-                const name = util.fieldString(L, idx, "name") orelse return error.WidgetMissingName;
-                return self.rt.renderWidget(self.arena, name, self.ctx, depth) catch |err| {
-                    self.error_message = self.rt.lastError();
-                    return err;
-                };
+                const want_w = convertDim(L, idx, "width");
+                const want_h = convertDim(L, idx, "height");
+                switch (child.width) {
+                    .auto => child.width = want_w,
+                    else => {},
+                }
+                switch (child.height) {
+                    .auto => child.height = want_h,
+                    else => {},
+                }
+                if (util.fieldNumber(L, idx, "flex")) |v| {
+                    if (child.flex == 0) child.flex = @max(0, @as(f32, @floatCast(v)));
+                }
+                if (child.id.len == 0) {
+                    if (util.fieldString(L, idx, "id")) |v| child.id = try self.dup(v);
+                }
+                if (child.min_width == 0) {
+                    if (util.fieldInt(L, idx, "min_width")) |v| child.min_width = @intCast(@max(0, @min(v, 65535)));
+                }
+                if (child.min_height == 0) {
+                    if (util.fieldInt(L, idx, "min_height")) |v| child.min_height = @intCast(@max(0, @min(v, 65535)));
+                }
+                if (child.max_width == 0) {
+                    if (util.fieldInt(L, idx, "max_width")) |v| child.max_width = @intCast(@max(0, @min(v, 65535)));
+                }
+                if (child.max_height == 0) {
+                    if (util.fieldInt(L, idx, "max_height")) |v| child.max_height = @intCast(@max(0, @min(v, 65535)));
+                }
+                return child;
             }
             const node = try self.arena.create(ui.Node);
             node.* = .{ .kind = kind };
@@ -1375,4 +1396,29 @@ fn c_ctx_read_file(L: ?*lua.lua_State) callconv(.c) c_int {
 
 fn selfFromUpvalueFree(L: util.State) *Runtime {
     return Runtime.selfFromUpvalue(L);
+}
+
+pub fn executeFile(rt: *Runtime, path: []const u8) !void {
+    const code = std.Io.Dir.cwd().readFileAlloc(rt.io, path, rt.gpa, .limited(4 * 1024 * 1024)) catch |err| {
+        const msg = try std.fmt.allocPrint(rt.gpa, "cannot read {s}: {s}", .{ path, @errorName(err) });
+        defer rt.gpa.free(msg);
+        rt.setError(msg);
+        return error.FileRead;
+    };
+    defer rt.gpa.free(code);
+    const path_z = try util.dupeZ(rt.gpa, path);
+    defer rt.gpa.free(path_z);
+    var err = std.ArrayList(u8).empty;
+    defer err.deinit(rt.gpa);
+    const rc = lua.luaL_loadbuffer(rt.L, code.ptr, code.len, path_z.ptr);
+    if (rc != 0) {
+        if (util.getString(rt.L, -1)) |m| err.appendSlice(rt.gpa, m) catch {};
+        util.pop(rt.L, 1);
+        rt.setError(err.items);
+        return error.LuaCompileError;
+    }
+    util.pcall(rt.L, 0, 0, &err, rt.gpa) catch {
+        rt.setError(err.items);
+        return error.LuaError;
+    };
 }

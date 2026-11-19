@@ -66,6 +66,8 @@ fn doctor(init: std.process.Init) !void {
         std.Io.Dir.cwd().access(init.io, p, .{}) catch break :blk false;
         break :blk true;
     } else false;
+    const data_path = dataDirPath(init.gpa) catch null;
+    defer if (data_path) |p| init.gpa.free(p);
     try w.interface.print(
         \\bloob doctor
         \\  version:           {s}
@@ -92,7 +94,7 @@ fn doctor(init: std.process.Init) !void {
         env.get("PWD") orelse ".",
         cfg_path orelse "(none)",
         if (cfg_exists) "yes" else "no",
-        env.get("XDG_DATA_HOME") orelse "(XDG_DATA_HOME unset)",
+        data_path orelse "(unavailable)",
         if (env.get("OPENAI_API_KEY") != null) "set" else "unset",
         if (env.get("ANTHROPIC_API_KEY") != null) "set" else "unset",
         "checked via exec at tool time",
@@ -263,7 +265,7 @@ pub fn main(process_init: std.process.Init) !u8 {
         .cwd = cwd,
     });
     defer app.deinit();
-    app.initLua(cli.config, cli.no_config);
+    app.initLua(cli.config, cli.no_config, cli.safe_mode);
     app.initSessions(cli.session, cli.resume_session);
     app.run() catch |err| {
         terminal.deinit();
@@ -355,7 +357,7 @@ fn selfTest(init: std.process.Init, cwd: []const u8) !void {
     var fake_terminal = term.Terminal{};
     var app = try app_mod.App.init(init.gpa, init.io, &fake_terminal, .{ .cwd = cwd, .model = "mock/fixture" });
     defer app.deinit();
-    app.initLua(null, true);
+    app.initLua(null, true, false);
     const rt = app.lua orelse {
         try writeStdout(init, "self-test: FAIL (Lua runtime unavailable)\n");
         return error.SelfTestFailed;
@@ -385,5 +387,11 @@ fn selfTest(init: std.process.Init, cwd: []const u8) !void {
 fn userConfigPath(gpa: std.mem.Allocator) !?[]u8 {
     if (env.get("XDG_CONFIG_HOME")) |xdg| return try std.fmt.allocPrint(gpa, "{s}/bloob/init.lua", .{xdg});
     if (env.get("HOME")) |home| return try std.fmt.allocPrint(gpa, "{s}/.config/bloob/init.lua", .{home});
+    return null;
+}
+
+fn dataDirPath(gpa: std.mem.Allocator) !?[]u8 {
+    if (env.get("XDG_DATA_HOME")) |xdg| return try std.fmt.allocPrint(gpa, "{s}/bloob/sessions", .{xdg});
+    if (env.get("HOME")) |home| return try std.fmt.allocPrint(gpa, "{s}/.local/share/bloob/sessions", .{home});
     return null;
 }
