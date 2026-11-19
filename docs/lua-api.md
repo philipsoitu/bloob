@@ -427,7 +427,7 @@ Layout functions, widgets and Lua tools receive a new read-only snapshot table:
 | `theme` | string | Active theme name |
 | `mode` | string | `"insert"` or `"normal"` |
 | `state` | string | `"idle"`, `"streaming"`, `"awaiting_approval"`, `"executing_tools"`, `"failed"` or `"cancelled"` |
-| `session_id` | string | Currently `"local"` |
+| `session_id` | string | Current durable session id |
 | `git_branch` | string | Placeholder; currently always `""` |
 | `busy` | boolean | Streaming or executing tools |
 | `message_count` | integer | Conversation message count |
@@ -435,8 +435,9 @@ Layout functions, widgets and Lua tools receive a new read-only snapshot table:
 | `bloob_version`, `api_version` | string/integer | Runtime version information |
 | `agents` | table | Placeholder; currently always empty |
 
-There is **no** `ctx:read_file`, `ctx:write_file`, async task API, session
-history or mutable engine handle in this build.
+`ctx:read_file(path)` performs a bounded, workspace-checked read and returns
+`content` or `nil, error`. There is no `ctx:write_file`, async task API or
+mutable engine handle in this build.
 
 ## Data conversion and limits
 
@@ -455,17 +456,21 @@ history or mutable engine handle in this build.
 
 ## Status / not implemented
 
-The following namespaces or features do not exist yet:
+The following namespaces or features do not exist yet or are intentionally
+partial:
 
-- sessions, persistence, `bloob.storage`;
-- plugins, manifests, trust and lifecycle (`bloob.plugins` is empty);
+- `bloob.storage` (namespaced plugin persistence);
+- plugin manifests, capability negotiation, `setup`/`teardown` lifecycle and
+  state migration (`plugin.lua` top-level execution works);
 - agents, subagents, strategies and workflows (`bloob.agent` is empty);
 - MCP, LSP, Tree-sitter;
 - async Lua tasks or promises;
-- model routing use;
-- workspace file access from Lua tools;
 - visual mode, key chords and user-defined modes;
 - rich dialogs, focus APIs and scrollable custom widgets.
 
-See [security.md](security.md) before running configuration from an untrusted
+Implemented and tested in this checkpoint: sessions/persistence outside Lua,
+user plugin loading, model routing hooks, `ctx:read_file` for Lua tools, and
+`tool.before_execute`/`tool.after_execute` events. See
+[plugins.md](plugins.md), [sessions.md](sessions.md) and
+[security.md](security.md) before running configuration from an untrusted
 source.

@@ -474,3 +474,17 @@ test "key specs" {
     try std.testing.expectEqual(@as(u21, 'p'), k.char);
     try std.testing.expect(parseSpec("<leader>a", '\\') == null);
 }
+
+test "malformed CSI does not panic" {
+    const Sink = struct {
+        count: usize = 0,
+        fn handle(self: *@This(), ev: Event) !void {
+            if (ev == .key) self.count += 1;
+        }
+    };
+    var p = Parser.init(std.testing.allocator);
+    defer p.deinit();
+    var sink = Sink{};
+    try p.feed("\x1b[1;0A\x1b[99999999999999999999;5C", &sink, Sink.handle);
+    try std.testing.expect(sink.count <= 2);
+}

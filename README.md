@@ -4,7 +4,7 @@
 
 The default application works with zero configuration. The UI is built from the same declarative primitives exposed to Lua, so users can replace layouts, register widgets, add keybindings, tools, commands, themes and hooks without recompiling Zig.
 
-> Status: active implementation. See [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) for an honest feature matrix and known gaps.
+> Status: usable first implementation. Sessions, real streaming providers (OpenAI-compatible and Anthropic Messages), workspace tools with approvals, headless `--print`/`--json`, Lua layouts/widgets/commands/tools/events and trusted user plugins are implemented. See [`IMPLEMENTATION_STATUS.md`](IMPLEMENTATION_STATUS.md) for the feature matrix and known gaps.
 
 ## Quick start
 
@@ -25,7 +25,7 @@ Requirements: Nix flakes, Zig 0.17.1, LuaJIT 2.1 (provided by the dev shell), a 
 bloob [--cwd PATH] [--config PATH] [--no-config] [--safe-mode]
       [--model provider/model] [--resume [ID]] [--session ID]
       [--print [PROMPT]] [--json] [--list-models] [--list-sessions]
-      [--doctor] [--version] [--help]
+      [--delete-session ID] [--doctor] [--self-test] [--version] [--help]
 ```
 
 ## Configuration
@@ -58,3 +58,27 @@ ui.set_layout(ui.column({
 ## License
 
 MIT. See `LICENSE`.
+
+## Features
+
+- Native Zig TUI: chat, multiline editor, streaming, scrolling, mouse wheel,
+  focus, command palette, help, status bar, approval modal and terminal restore.
+- Declarative Lua UI: default layout is Lua; replace it, register widgets, use
+  signals/buttons, customize themes and keymaps without recompiling.
+- Agent runtime: OpenAI-compatible and Anthropic streaming, normalized tool
+  calls, usage accounting, cancellation, bounded tool loops.
+- Workspace tools: read/list/search/edit/write/shell/git with Zig-enforced path
+  safety, approvals, diff preview and bounded output.
+- Sessions: incremental JSONL persistence, resume, list and delete.
+- Headless operation: `--print` / `--json`, fixture or real providers, safe
+  default-deny for approval-gated tools.
+- Trusted user plugins from `$XDG_CONFIG_HOME/bloob/plugins/`.
+
+## Tests
+
+```sh
+nix develop -c zig build test
+nix develop -c tests/pty_smoke.sh
+nix develop -c luajit examples/verify.lua
+./zig-out/bin/bloob --self-test
+```

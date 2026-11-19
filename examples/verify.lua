@@ -447,10 +447,10 @@ local checks = {
   end,
 
   ["custom-tool"] = function(rt)
-    local tool = rt.tools.get("workspace.snapshot")
-    assert(tool, "workspace.snapshot was not registered")
+    local tool = rt.tools.get("workspace.count_lines")
+    assert(tool, "workspace.count_lines was not registered")
     assert(type(tool.schema) == "table" and tool.schema.type == "object", "invalid tool schema")
-    assert(rt.state.tools["workspace.snapshot"], "tool was not passed to the host")
+    assert(rt.state.tools["workspace.count_lines"], "tool was not passed to the host")
     assert(rt.bloob.command.registry["lua-tools"], "lua-tools command was not registered")
     local result = tool.run({
       cwd = "/tmp/bloob-example",
@@ -464,10 +464,14 @@ local checks = {
       completion_tokens = 20,
       total_tokens = 30,
       api_version = 1,
-    }, { label = "harness" })
-    assert(result.label == "harness", "tool args were not passed through")
+      read_file = function(_, path)
+        assert(path == "README.md", "read_file path was not passed")
+        return "one\ntwo\n", nil
+      end,
+    }, { path = "README.md" })
+    assert(result.path == "README.md", "tool args were not passed through")
+    assert(result.lines == 2, "line count is wrong")
     assert(result.cwd == "/tmp/bloob-example", "tool context was not passed through")
-    assert(result.busy == false, "tool boolean conversion is wrong")
   end,
 
   ["custom-command"] = function(rt)

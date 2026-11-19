@@ -20,7 +20,7 @@ M.features = {
   keymaps = true,
   events = true,
   hot_reload = true,
-  plugins = false,
+  plugins = true,
   mcp = false,
   lsp = false,
 }

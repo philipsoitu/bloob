@@ -84,8 +84,8 @@ pub const Terminal = struct {
         raw.lflag.IEXTEN = false;
         raw.cflag.CSIZE = .CS8;
         raw.cflag.PARENB = false;
-        raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
-        raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
+        raw.cc[@backingInt(std.posix.V.MIN)] = 1;
+        raw.cc[@backingInt(std.posix.V.TIME)] = 0;
         try std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, raw);
         t.raw_enabled = true;
         errdefer t.deinit();

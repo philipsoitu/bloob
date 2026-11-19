@@ -196,3 +196,30 @@ The store is intended for one process per session at a time. Concurrent writers
 are not coordinated beyond the append-only line boundary; the sidecar can be
 replaced by the last writer, and JSONL remains valid because each writer appends
 complete lines.
+
+## Application integration
+
+The interactive app creates a session after Lua config/plugin loading, writes a
+new session by default, and supports:
+
+```text
+bloob --resume [ID]       # latest when ID omitted
+bloob --session ID
+bloob --list-sessions
+bloob --delete-session ID
+```
+
+Inside the TUI:
+
+```text
+/session list
+/session new
+/session resume ID
+/session delete ID
+/export [path.md]
+```
+
+Messages are appended as they are finalized (streaming assistant messages are
+not persisted mid-stream). Tool calls and results are part of the message
+stream, so a resumed conversation retains its audit trail without replaying
+side-effecting tools.

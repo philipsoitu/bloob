@@ -38,3 +38,39 @@ The permission engine, workspace path checks and approval decisions live in Zig.
 The agent core defines normalized stream events. The offline `mock/fixture` provider is deterministic and always available. Real providers are implemented behind the same interface. The first real provider transport uses curl, launched with fixed argv (no shell), and parses its output as SSE; this can later be replaced by `std.http` without touching the agent interface.
 
 **Current status:** interactive OpenAI, Anthropic and OpenAI-compatible streaming exist. Headless `--print` remains fixture-only and does not load the Lua runtime.
+
+## ADR-007: Sessions are append-only JSONL with atomic sidecar metadata
+
+Conversation history is stored in `<id>.jsonl` (header + one message per line)
+plus `<id>.meta.json` for cheap listing. Files are 0600, directories 0700.
+`load` truncates only an incomplete/malformed trailing line; corruption earlier
+in the file is a hard error. Resuming never replays side-effecting tools.
+The App appends new messages incrementally and tracks a persisted-count cursor
+so streaming messages are only persisted after the stream is finalized.
+
+## ADR-008: Trusted user plugins, no project auto-execution
+
+Plugins load only from the user config directory
+(`$XDG_CONFIG_HOME/bloob/plugins/<name>/plugin.lua` or the XDG fallback). They
+share the trusted Lua state with `init.lua`; LuaJIT FFI means this is not a
+sandbox. `--safe-mode` and `--no-config` disable plugin loading. Project-local
+plugins/config never execute automatically. Manifests, capability negotiation,
+teardown and untrusted isolation are future work.
+
+## ADR-009: Provider secrets in a temporary curl config
+
+The OpenAI-compatible/Anthropic transport spawns curl with a temporary 0600
+config file containing the URL and authorization header; the API key is not in
+argv/process listings. The file is removed on stream teardown. The body is sent
+through stdin. Base URLs are validated to start with `http://` or `https://`,
+and curl is restricted to the corresponding protocol. This is a pragmatic
+transport choice behind the provider interface; it can be replaced with
+`std.http` without changing the agent/Lua APIs.
+
+## ADR-010: Interactive shell tools run asynchronously
+
+The TUI special-cases the `shell` tool into `src/tools/shell_job.zig`: the child
+runs with nonblocking pipes, is polled by the main loop, has a hard deadline and
+output cap, and Ctrl-C kills/cancels it. Headless mode retains the simpler
+synchronous capture path. Process-tree termination is currently best-effort:
+the direct `/bin/sh` child is killed, not an OS process group.

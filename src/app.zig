@@ -14,6 +14,7 @@ const lua_runtime = @import("lua/runtime.zig");
 const workspace_mod = @import("core/workspace.zig");
 const permissions = @import("tools/permissions.zig");
 const tools = @import("tools/tools.zig");
+const shell_job = @import("tools/shell_job.zig");
 const provider_stream = @import("providers/stream.zig");
 const provider_registry = @import("providers/registry.zig");
 const provider_request = @import("providers/request.zig");
@@ -165,6 +166,8 @@ pub const App = struct {
     last_tool_summary: []u8 = &.{},
     provider_stream: ?*provider_stream.Stream = null,
     provider_emit_pos: usize = 0,
+    shell_job: ?*shell_job.Job = null,
+    shell_call: ?PendingTool = null,
     session_store: ?sessions_store.Store = null,
     session: ?sessions_store.Session = null,
     persisted_count: usize = 0,
@@ -172,6 +175,7 @@ pub const App = struct {
     safe_mode: bool = false,
     config_disabled: bool = false,
     plugins_loaded: std.ArrayList([]u8) = .empty,
+    context_files: std.ArrayList([]u8) = .empty,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, terminal: *term.Terminal, opts: struct {
         model: ?[]const u8 = null,
@@ -338,7 +342,7 @@ pub const App = struct {
         self.lua_config_path = path;
         const lua_host = self.host();
         const rt = lua_runtime.Runtime.init(self.gpa, self.io, lua_host) catch |err| {
-            const msg = std.fmt.allocPrint(self.gpa, "Lua runtime unavailable: {s}",  .{@errorName(err)}) catch "Lua runtime unavailable";
+            const msg = std.fmt.allocPrint(self.gpa, "Lua runtime unavailable: {s}", .{@errorName(err)}) catch "Lua runtime unavailable";
             defer self.gpa.free(msg);
             self.notify(msg, true);
             return;
@@ -358,7 +362,7 @@ pub const App = struct {
         if (!ok) {
             rt.deinit();
             const fallback = lua_runtime.Runtime.init(self.gpa, self.io, lua_host) catch |err| {
-                const msg = std.fmt.allocPrint(self.gpa, "Lua runtime unavailable: {s}",  .{@errorName(err)}) catch "Lua runtime unavailable";
+                const msg = std.fmt.allocPrint(self.gpa, "Lua runtime unavailable: {s}", .{@errorName(err)}) catch "Lua runtime unavailable";
                 defer self.gpa.free(msg);
                 self.notify(msg, true);
                 return;
@@ -428,7 +432,7 @@ pub const App = struct {
         const old_model = self.gpa.dupe(u8, self.model) catch null;
         const lua_host = self.host();
         const candidate = lua_runtime.Runtime.init(self.gpa, self.io, lua_host) catch |err| {
-            const msg = std.fmt.allocPrint(self.gpa, "reload failed: {s}",  .{@errorName(err)}) catch "reload failed";
+            const msg = std.fmt.allocPrint(self.gpa, "reload failed: {s}", .{@errorName(err)}) catch "reload failed";
             defer self.gpa.free(msg);
             self.notify(msg, true);
             return;
@@ -506,8 +510,12 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        if (self.shell_job) |j| j.deinit();
+        if (self.shell_call) |*c| c.deinit(self.gpa);
         if (self.session) |*s| s.deinit();
         for (self.plugins_loaded.items) |p| self.gpa.free(p);
+        for (self.context_files.items) |p| self.gpa.free(p);
+        self.context_files.deinit(self.gpa);
         self.plugins_loaded.deinit(self.gpa);
         if (self.session_store) |*s| s.deinit();
         if (self.provider_stream) |s| s.deinit();
@@ -594,29 +602,46 @@ pub const App = struct {
             if (self.parser.buf.items.len == 1 and self.parser.buf.items[0] == 0x1b and now - self.last_input_ms > 40) {
                 try self.parser.flushEscape(self, App.handleInput);
             }
-            const timeout: i32 = if (self.agent_phase == .streaming) 20 else 60;
-            var fds: [3]std.posix.pollfd = undefined;
+            const timeout: i32 = if (self.agent_phase == .streaming or self.shell_job != null) 20 else 60;
+            var fds: [5]std.posix.pollfd = undefined;
             var nfds: usize = 1;
             fds[0] = .{ .fd = std.posix.STDIN_FILENO, .events = std.posix.POLL.IN };
+            var provider_count: usize = 0;
             if (self.provider_stream) |s| {
                 if (s.stdoutFd()) |fd| {
                     fds[nfds] = .{ .fd = fd, .events = std.posix.POLL.IN };
                     nfds += 1;
+                    provider_count += 1;
                 }
                 if (s.stderrFd()) |fd| {
                     fds[nfds] = .{ .fd = fd, .events = std.posix.POLL.IN };
                     nfds += 1;
+                    provider_count += 1;
+                }
+            }
+            var shell_count: usize = 0;
+            if (self.shell_job) |j| {
+                if (j.stdoutFd()) |fd| {
+                    fds[nfds] = .{ .fd = fd, .events = std.posix.POLL.IN };
+                    nfds += 1;
+                    shell_count += 1;
+                }
+                if (j.stderrFd()) |fd| {
+                    fds[nfds] = .{ .fd = fd, .events = std.posix.POLL.IN };
+                    nfds += 1;
+                    shell_count += 1;
                 }
             }
             _ = std.posix.poll(fds[0..nfds], timeout) catch continue;
-            if (nfds > 1) {
+            if (provider_count > 0) {
                 var provider_ready = false;
                 var pi: usize = 1;
-                while (pi < nfds) : (pi += 1) {
+                while (pi < 1 + provider_count) : (pi += 1) {
                     if (fds[pi].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR) != 0) provider_ready = true;
                 }
                 if (provider_ready) self.pumpProvider();
             }
+            if (self.shell_job != null) self.pumpShell();
             if (self.provider_stream != null and self.provider_stream.?.acc.done) self.syncProvider();
             if (fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP) != 0) {
                 const n = self.terminal.read(&read_buf) catch |err| switch (err) {
@@ -750,7 +775,7 @@ pub const App = struct {
         switch (entry.action) {
             .command => |c| {
                 self.runCommand(c.name, "") catch |err| {
-                    const msg = std.fmt.allocPrint(self.gpa, "keymap command failed: {s}",  .{@errorName(err)}) catch "keymap command failed";
+                    const msg = std.fmt.allocPrint(self.gpa, "keymap command failed: {s}", .{@errorName(err)}) catch "keymap command failed";
                     defer self.gpa.free(msg);
                     self.notify(msg, true);
                 };
@@ -771,6 +796,7 @@ pub const App = struct {
     }
 
     fn handleCtrlC(self: *App) void {
+        if (self.cancelShellRun()) return;
         if (self.approval != null) {
             self.denyApproval();
             self.notify("Tool call denied", false);
@@ -1086,7 +1112,10 @@ pub const App = struct {
             const p = self.jsonInnerDup(value) catch "";
             defer if (p.len > 0) self.gpa.free(p);
             const payload = std.fmt.allocPrint(self.gpa, "{{\"prompt\":\"{s}\"}}", .{p}) catch null;
-            if (payload) |pl| { defer self.gpa.free(pl); _ = l.emit("agent.before_turn", pl); }
+            if (payload) |pl| {
+                defer self.gpa.free(pl);
+                _ = l.emit("agent.before_turn", pl);
+            }
         }
         _ = try self.conversation.add(.user, value, self.nowMs());
         self.persistPendingMessages();
@@ -1264,7 +1293,132 @@ pub const App = struct {
         self.executeToolCall(call);
     }
 
+    fn startShellTool(self: *App, call: PendingTool) void {
+        const ctx = self.toolContext() orelse {
+            self.appendToolMessage(call, "Workspace unavailable", true);
+            self.tool_index += 1;
+            self.processNextTool();
+            return;
+        };
+        var parsed = std.json.parseFromSlice(std.json.Value, self.gpa, call.args, .{}) catch {
+            self.appendToolMessage(call, "invalid shell arguments", true);
+            self.tool_index += 1;
+            self.processNextTool();
+            return;
+        };
+        defer parsed.deinit();
+        const obj = switch (parsed.value) {
+            .object => |o| o,
+            else => {
+                self.appendToolMessage(call, "shell arguments must be an object", true);
+                self.tool_index += 1;
+                self.processNextTool();
+                return;
+            },
+        };
+        const command = if (obj.get("command")) |v| switch (v) {
+            .string => |s| s,
+            else => "",
+        } else "";
+        if (command.len == 0) {
+            self.appendToolMessage(call, "shell: missing command", true);
+            self.tool_index += 1;
+            self.processNextTool();
+            return;
+        }
+        const cwd_rel = if (obj.get("cwd")) |v| switch (v) {
+            .string => |s| s,
+            else => ".",
+        } else ".";
+        const timeout_ms: u64 = if (obj.get("timeout_ms")) |v| switch (v) {
+            .integer => |i| @intCast(@max(100, @min(i, 120000))),
+            .float => |f| @intFromFloat(@max(100, @min(f, 120000))),
+            else => 30000,
+        } else 30000;
+        const cwd_abs = ctx.workspace.resolveRead(cwd_rel) catch |err| {
+            self.appendToolMessage(call, @errorName(err), true);
+            self.tool_index += 1;
+            self.processNextTool();
+            return;
+        };
+        defer self.gpa.free(cwd_abs);
+        const job = shell_job.Job.start(self.gpa, self.io, command, cwd_abs, timeout_ms, 256 * 1024) catch |err| {
+            self.appendToolMessage(call, @errorName(err), true);
+            self.tool_index += 1;
+            self.processNextTool();
+            return;
+        };
+        if (self.shell_job) |old| old.deinit();
+        if (self.shell_call) |*old| old.deinit(self.gpa);
+        self.shell_job = job;
+        self.shell_call = .{
+            .id = self.gpa.dupe(u8, call.id) catch "",
+            .name = self.gpa.dupe(u8, call.name) catch "",
+            .args = self.gpa.dupe(u8, call.args) catch "",
+        };
+        self.agent_phase = .executing_tools;
+        self.dirty = true;
+    }
+
+    fn pumpShell(self: *App) void {
+        const j = self.shell_job orelse return;
+        j.pump();
+        if (j.done) self.finishShellRun(true);
+    }
+
+    fn finishShellRun(self: *App, continue_turn: bool) void {
+        const j = self.shell_job orelse return;
+        const call = self.shell_call orelse {
+            j.deinit();
+            self.shell_job = null;
+            return;
+        };
+        self.shell_job = null;
+        self.shell_call = null;
+        var content = std.ArrayList(u8).empty;
+        defer content.deinit(self.gpa);
+        content.appendSlice(self.gpa, j.out.items) catch {};
+        if (j.err.items.len > 0) {
+            if (content.items.len > 0) content.appendSlice(self.gpa, "\n") catch {};
+            content.appendSlice(self.gpa, "[stderr]\n") catch {};
+            content.appendSlice(self.gpa, j.err.items) catch {};
+        }
+        if (j.timed_out) content.appendSlice(self.gpa, "\n[command timed out]\n") catch {};
+        if (j.cancelled and !j.timed_out) content.appendSlice(self.gpa, "\n[command cancelled]\n") catch {};
+        if (j.truncated) content.appendSlice(self.gpa, "\n[output truncated]\n") catch {};
+        const code = j.exitCode();
+        const summary = std.fmt.allocPrint(self.gpa, "shell exit {d}", .{code}) catch "shell";
+        defer self.gpa.free(summary);
+        self.setLastToolSummary(summary);
+        self.emitToolAfter(call.name, code != 0, summary);
+        self.appendToolMessage(call, content.items, code != 0);
+        var owned = call;
+        owned.deinit(self.gpa);
+        j.deinit();
+        if (!continue_turn) {
+            for (self.pending_tools.items) |*p| p.deinit(self.gpa);
+            self.pending_tools.clearRetainingCapacity();
+            self.tool_index = 0;
+            self.agent_phase = .cancelled;
+            self.notify("Shell command cancelled", false);
+            self.dirty = true;
+            return;
+        }
+        self.tool_index += 1;
+        self.processNextTool();
+    }
+
+    fn cancelShellRun(self: *App) bool {
+        const j = self.shell_job orelse return false;
+        j.cancel();
+        self.finishShellRun(false);
+        return true;
+    }
     fn executeToolCall(self: *App, call: PendingTool) void {
+        if (std.mem.eql(u8, call.name, "shell")) {
+            self.startShellTool(call);
+            return;
+        }
         const ctx = self.toolContext() orelse {
             self.appendToolMessage(call, "Workspace unavailable", true);
             self.tool_index += 1;
@@ -1404,8 +1558,12 @@ pub const App = struct {
         defer resolved.deinit();
         const schemas = self.collectToolSchemas() catch return error.OutOfMemory;
         defer self.gpa.free(schemas);
-        const system = prompts.systemPrompt(self.gpa, self.workspaceRoot()) catch return error.OutOfMemory;
-        defer self.gpa.free(system);
+        const base_system = prompts.systemPrompt(self.gpa, self.workspaceRoot()) catch return error.OutOfMemory;
+        defer self.gpa.free(base_system);
+        const context = self.buildContextText() catch null;
+        defer if (context) |c| self.gpa.free(c);
+        const system = if (context) |c| std.mem.concat(self.gpa, u8, &.{ base_system, c }) catch return error.OutOfMemory else base_system;
+        defer if (context != null) self.gpa.free(system);
         const body = switch (resolved.kind) {
             .openai => provider_request.buildOpenAi(self.gpa, resolved.model, system, &self.conversation, schemas) catch return error.OutOfMemory,
             .anthropic => provider_request.buildAnthropic(self.gpa, resolved.model, system, &self.conversation, schemas, 8192) catch return error.OutOfMemory,
@@ -1669,8 +1827,7 @@ pub const App = struct {
             "\n\n_The fixture is proposing a tool call. Approval and results are handled by the real Zig tool engine._\n"
         else
             "\n\n- Lua configuration and the composable UI are next.\n- Try `/help`, `/theme catppuccin`, or `/tools`.\n";
-        const response = try std.fmt.allocPrint(self.gpa,
-            "You said:\n\n> {s}\n\nThis response is produced by bloob's deterministic **fixture provider**. It streams in small deltas so the UI, cancellation and persistence paths can be tested without network access.\n\n```zig\nconst std = @import(\"std\");\npub fn main() !void {{\n    std.debug.print(\"hello from bloob\\n\", .{{}});\n}}\n```{s}", .{ truncatePrompt(prompt), suffix });
+        const response = try std.fmt.allocPrint(self.gpa, "You said:\n\n> {s}\n\nThis response is produced by bloob's deterministic **fixture provider**. It streams in small deltas so the UI, cancellation and persistence paths can be tested without network access.\n\n```zig\nconst std = @import(\"std\");\npub fn main() !void {{\n    std.debug.print(\"hello from bloob\\n\", .{{}});\n}}\n```{s}", .{ truncatePrompt(prompt), suffix });
         if (self.stream_text.len > 0) self.gpa.free(self.stream_text);
         self.stream_text = response;
         self.stream_pos = 0;
@@ -1793,18 +1950,7 @@ pub const App = struct {
             }
             self.appendSystemMessage(buf.items);
         } else if (std.mem.eql(u8, name, "context")) {
-            const usage = self.conversation.totalUsage();
-            const msg = std.fmt.allocPrint(self.gpa, "Workspace: {s}\nSession: {s}\nModel: {s}\nMessages: {d}\nTokens: {d}\nTools: {d} built-in, {d} Lua", .{
-                self.workspaceRoot(),
-                self.session_id,
-                self.model,
-                self.conversation.messages.items.len,
-                usage.total(),
-                tools.defs.len,
-                if (self.lua) |l| l.tools.items.len else 0,
-            }) catch return;
-            defer self.gpa.free(msg);
-            self.appendSystemMessage(msg);
+            self.contextCommand(args);
         } else if (std.mem.eql(u8, name, "diff")) {
             const ctx = self.toolContext() orelse {
                 self.notify("Workspace unavailable", true);
@@ -1837,6 +1983,13 @@ pub const App = struct {
     }
 
     fn cancelCurrentWork(self: *App) void {
+        if (self.shell_job != null) {
+            self.shell_job.?.cancel();
+            self.shell_job.?.deinit();
+            self.shell_job = null;
+        }
+        if (self.shell_call) |*c| c.deinit(self.gpa);
+        self.shell_call = null;
         if (self.provider_stream != null) {
             _ = self.cancelProvider();
         } else if (self.agent_phase == .streaming) {
@@ -2512,6 +2665,82 @@ pub const App = struct {
         }
     }
 
+    fn buildContextText(self: *App) ![]u8 {
+        var out = std.ArrayList(u8).empty;
+        errdefer out.deinit(self.gpa);
+        if (self.context_files.items.len == 0) return out.toOwnedSlice(self.gpa);
+        try out.appendSlice(self.gpa, "\n\nContext files selected by the user (untrusted repository content):\n");
+        var total: usize = 0;
+        for (self.context_files.items) |rel| {
+            if (total > 128 * 1024) break;
+            const ws = if (self.workspace) |*w| w else continue;
+            const abs = ws.resolveRead(rel) catch continue;
+            defer self.gpa.free(abs);
+            const data = std.Io.Dir.cwd().readFileAlloc(self.io, abs, self.gpa, .limited(32 * 1024)) catch continue;
+            defer self.gpa.free(data);
+            try appendFmt(self.gpa, &out, "\n--- {s} ---\n", .{rel});
+            try out.appendSlice(self.gpa, data);
+            try out.append(self.gpa, '\n');
+            total += data.len;
+        }
+        return out.toOwnedSlice(self.gpa);
+    }
+
+    fn contextCommand(self: *App, args: []const u8) void {
+        const trimmed = std.mem.trim(u8, args, " ");
+        if (std.mem.startsWith(u8, trimmed, "add ")) {
+            const path = std.mem.trim(u8, trimmed[4..], " ");
+            const ws = if (self.workspace) |*w| w else {
+                self.notify("Workspace unavailable", true);
+                return;
+            };
+            const abs = ws.resolveRead(path) catch |err| {
+                self.notify(@errorName(err), true);
+                return;
+            };
+            defer self.gpa.free(abs);
+            const rel = ws.relative(abs);
+            for (self.context_files.items) |existing| {
+                if (std.mem.eql(u8, existing, rel)) {
+                    self.notify("File already in context", false);
+                    return;
+                }
+            }
+            self.context_files.append(self.gpa, self.gpa.dupe(u8, rel) catch return) catch return;
+            self.notify("Added file to context", false);
+            return;
+        }
+        if (std.mem.startsWith(u8, trimmed, "remove ")) {
+            const path = std.mem.trim(u8, trimmed[7..], " ");
+            var i: usize = 0;
+            while (i < self.context_files.items.len) : (i += 1) {
+                if (std.mem.eql(u8, self.context_files.items[i], path)) {
+                    const old = self.context_files.orderedRemove(i);
+                    self.gpa.free(old);
+                    self.notify("Removed file from context", false);
+                    return;
+                }
+            }
+            self.notify("File not in context", true);
+            return;
+        }
+        if (std.mem.eql(u8, trimmed, "clear")) {
+            for (self.context_files.items) |p| self.gpa.free(p);
+            self.context_files.clearRetainingCapacity();
+            self.notify("Context files cleared", false);
+            return;
+        }
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(self.gpa);
+        appendFmt(self.gpa, &buf, "Workspace: {s}\nSession: {s}\nModel: {s}\n", .{ self.workspaceRoot(), self.session_id, self.model }) catch {};
+        if (self.context_files.items.len == 0) {
+            buf.appendSlice(self.gpa, "Context files: none (use /context add PATH)") catch {};
+        } else {
+            buf.appendSlice(self.gpa, "Context files:\n") catch {};
+            for (self.context_files.items) |p| appendFmt(self.gpa, &buf, "  {s}\n", .{p}) catch {};
+        }
+        self.appendSystemMessage(buf.items);
+    }
     fn emitSessionEvent(self: *App, name: []const u8) void {
         const l = self.lua orelse return;
         const id_esc = self.jsonInnerDup(self.session_id) catch return;
@@ -2540,7 +2769,7 @@ pub const App = struct {
 
 fn truncatePath(path: []const u8, width: u16) []const u8 {
     if (text.displayWidth(path) <= width) return path;
-    if (width <= 3) return path[path.len -| width ..];
+    if (width <= 3) return path[path.len -| width..];
     var start = path.len;
     var w: usize = 0;
     while (start > 0) {
@@ -2597,7 +2826,10 @@ fn hostSetTheme(ctx: *anyopaque, name: []const u8) void {
             const n = self.jsonInnerDup(name) catch "";
             defer if (n.len > 0) self.gpa.free(n);
             const payload = std.fmt.allocPrint(self.gpa, "{{\"theme\":\"{s}\"}}", .{n}) catch null;
-            if (payload) |p| { defer self.gpa.free(p); _ = l.emit("theme.changed", p); }
+            if (payload) |p| {
+                defer self.gpa.free(p);
+                _ = l.emit("theme.changed", p);
+            }
         }
     }
 }
@@ -2614,7 +2846,7 @@ fn hostRunCommand(ctx: *anyopaque, name: []const u8, args: []const u8) void {
     self.command_depth += 1;
     defer self.command_depth -= 1;
     self.runCommand(name, args) catch |err| {
-        const msg = std.fmt.allocPrint(self.gpa, "command failed: {s}",  .{@errorName(err)}) catch "command failed";
+        const msg = std.fmt.allocPrint(self.gpa, "command failed: {s}", .{@errorName(err)}) catch "command failed";
         defer self.gpa.free(msg);
         self.notify(msg, true);
     };

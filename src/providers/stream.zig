@@ -103,7 +103,8 @@ pub const Stream = struct {
         const proto = if (std.mem.startsWith(u8, url, "https://")) "=https" else "=http";
         var cfg = std.ArrayList(u8).empty;
         defer cfg.deinit(gpa);
-        const head = try std.fmt.allocPrint(gpa,
+        const head = try std.fmt.allocPrint(
+            gpa,
             "url = \"{s}\"\nrequest = \"POST\"\nsilent\nshow-error\nno-buffer\nfail-with-body\nproto = \"{s}\"\nmax-time = 300\nconnect-timeout = 20\nheader = \"Content-Type: application/json\"\n",
             .{ url, proto },
         );
@@ -123,7 +124,7 @@ pub const Stream = struct {
             },
         }
         try cfg.appendSlice(gpa, "data-binary = \"@-\"\n");
-        const private_permissions: std.Io.File.Permissions = @enumFromInt(0o600);
+        const private_permissions: std.Io.File.Permissions = @fromBackingInt(@intCast(0o600));
         std.Io.Dir.cwd().writeFile(io, .{
             .sub_path = config_path,
             .data = cfg.items,
@@ -271,7 +272,7 @@ pub const Stream = struct {
                     }
                 },
                 .signal => |sig| {
-                    const msg = std.fmt.allocPrint(self.gpa, "provider terminated by signal {d}", .{@intFromEnum(sig)}) catch "provider terminated";
+                    const msg = std.fmt.allocPrint(self.gpa, "provider terminated by signal {d}", .{@backingInt(sig)}) catch "provider terminated";
                     defer self.gpa.free(msg);
                     self.acc.setError(msg);
                 },

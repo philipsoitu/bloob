@@ -164,8 +164,7 @@ pub fn run(init: std.Io, gpa: std.mem.Allocator, opts: Options) !void {
     _ = try conv.add(.user, opts.prompt, 0);
     if (registry.isMock(opts.model)) {
         try out.eventStart(opts.model);
-        const text = try std.fmt.allocPrint(gpa,
-            "[mock/fixture — deterministic offline output; no model was contacted]\n\nDeterministic fixture response.\nprompt: {s}\n", .{opts.prompt});
+        const text = try std.fmt.allocPrint(gpa, "[mock/fixture — deterministic offline output; no model was contacted]\n\nDeterministic fixture response.\nprompt: {s}\n", .{opts.prompt});
         defer gpa.free(text);
         try out.eventText(text);
         try out.eventDone(.{});

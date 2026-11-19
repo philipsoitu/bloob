@@ -154,6 +154,7 @@ test "lua custom widget and signals render" {
     try std.testing.expectEqual(ui.Kind.row, layout.children[0].kind);
     try std.testing.expectEqualStrings("Count: 2", layout.children[0].children[0].content.?);
     try std.testing.expectEqualStrings("+", layout.children[0].children[1].content.?);
+    try std.testing.expectEqual(@as(u16, 1), layout.children[0].height.cells);
 }
 
 test "lua keymap registration" {

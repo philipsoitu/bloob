@@ -23,11 +23,13 @@ What is real today:
 - `tools.get(name)` and `tools.list()` are available to Lua.
 - Custom tools go through the approval flow as the `custom` capability.
 
-What is not implemented yet:
+What remains limited:
 
-- There is no `ctx:read_file` and no `ctx:write_file`. The private
-  `bloob._read_file` helper is not a stable, workspace-checked tool API.
-- `permissions` metadata is not enforced by the Zig engine yet.
+- `ctx:read_file` is available and workspace-checked; there is no
+  `ctx:write_file` custom-tool helper. Write tools should be native tools or
+  explicit Lua file APIs added in a future milestone.
+- `permissions` metadata now selects the custom tool capability for the Zig
+  permission engine; it does not grant access by itself.
 - There is no direct "run tool" slash command, and mock/fixture does not emit
   tool calls for Lua tools.
 - If `run` raises an error, the UI reports `Lua tool failed` without a detailed

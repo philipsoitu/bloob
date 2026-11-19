@@ -40,3 +40,12 @@ This is not a full application test: it does not render the TUI, validate key
 specs with the Zig parser, execute native tools, or test provider streaming.
 
 See [../docs/getting-started.md](../docs/getting-started.md).
+
+## Plugin example
+
+`examples/plugins/hello/` is a trusted user plugin (not an `init.lua`). Copy it
+to `$XDG_CONFIG_HOME/bloob/plugins/hello/` and start bloob. It registers a
+widget, a command (`/hello.plugin`) and a normal-mode mapping (`Ctrl-H`).
+
+Plugin loading is skipped by `--safe-mode` and `--no-config`; project-local
+plugins are never auto-executed. See `docs/plugins.md`.

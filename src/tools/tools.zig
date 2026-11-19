@@ -261,7 +261,6 @@ fn shouldIgnore(path: []const u8) bool {
     const ignored = [_][]const u8{ ".git/", ".zig-cache/", "zig-out/", "node_modules/", "target/", ".venv/", "__pycache__/" };
     for (ignored) |ig| {
         if (std.mem.startsWith(u8, path, ig)) return true;
-
     }
     return false;
 }
@@ -769,19 +768,28 @@ pub fn preview(ctx: ToolContext, name: []const u8, args_json: []const u8) Previe
     if (std.mem.eql(u8, name, "read_file")) {
         const path = objString(obj, "path") orelse return previewError(ctx.gpa, "read_file: missing path");
         const summary = std.fmt.allocPrint(ctx.gpa, "Read {s}", .{path}) catch "";
-        if (ctx.workspace.resolveRead(path)) |abs| { defer ctx.gpa.free(abs); return .{ .summary = summary, .paths = makePathList(ctx.gpa, abs) }; } else |_| {}
+        if (ctx.workspace.resolveRead(path)) |abs| {
+            defer ctx.gpa.free(abs);
+            return .{ .summary = summary, .paths = makePathList(ctx.gpa, abs) };
+        } else |_| {}
         return .{ .summary = summary };
     }
     if (std.mem.eql(u8, name, "list_files")) {
         const path = objString(obj, "path") orelse ".";
         const summary = std.fmt.allocPrint(ctx.gpa, "List files in {s}", .{path}) catch "";
-        if (ctx.workspace.resolveRead(path)) |abs| { defer ctx.gpa.free(abs); return .{ .summary = summary, .paths = makePathList(ctx.gpa, abs) }; } else |_| {}
+        if (ctx.workspace.resolveRead(path)) |abs| {
+            defer ctx.gpa.free(abs);
+            return .{ .summary = summary, .paths = makePathList(ctx.gpa, abs) };
+        } else |_| {}
         return .{ .summary = summary };
     }
     if (std.mem.eql(u8, name, "search")) {
         const pattern = objString(obj, "pattern") orelse "";
         const summary = std.fmt.allocPrint(ctx.gpa, "Search for {s}", .{pattern}) catch "";
-        if (ctx.workspace.resolveRead(objString(obj, "path") orelse ".")) |abs| { defer ctx.gpa.free(abs); return .{ .summary = summary, .paths = makePathList(ctx.gpa, abs) }; } else |_| {}
+        if (ctx.workspace.resolveRead(objString(obj, "path") orelse ".")) |abs| {
+            defer ctx.gpa.free(abs);
+            return .{ .summary = summary, .paths = makePathList(ctx.gpa, abs) };
+        } else |_| {}
         return .{ .summary = summary };
     }
     if (std.mem.eql(u8, name, "shell")) {

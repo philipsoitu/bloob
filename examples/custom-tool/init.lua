@@ -1,10 +1,8 @@
 -- Custom Lua tool.
 --
--- The tool schema is sent to real providers. A model can only request this
--- tool by name; the offline mock/fixture provider does not call arbitrary Lua
--- tools. The current runtime does not expose a permission-checked
--- `ctx:read_file`, so this example uses only real context fields and arguments.
-
+-- The schema is sent to real providers. A model can request this tool by name;
+-- ctx:read_file is a permission-checked, bounded workspace read implemented by
+-- Zig (sensitive paths/symlinks are denied by the host).
 local bloob = require("bloob")
 local tools = require("bloob.tools")
 
@@ -16,44 +14,39 @@ local function list_lua_tools()
   return table.concat(names, ", ")
 end
 
-tools.register("workspace.snapshot", {
-  description = "Return a small snapshot of the current bloob session context.",
+tools.register("workspace.count_lines", {
+  description = "Count lines in a workspace file after a permission-checked read.",
   schema = {
     type = "object",
     properties = {
-      label = {
-        type = "string",
-        description = "Optional label to include in the result",
-      },
+      path = { type = "string", description = "Workspace-relative file path" },
     },
+    required = { "path" },
   },
-  -- Stored as tool metadata today. The Zig permission engine treats custom
-  -- Lua tools as the `custom` capability (ask by default); this list is not
-  -- used for enforcement yet.
   permissions = { "workspace.read" },
   run = function(ctx, args)
-    local label = tostring((args and args.label) or "snapshot")
+    local path = tostring((args and args.path) or "")
+    if path == "" then
+      return { error = "path is required" }
+    end
+    local content, err = ctx:read_file(path)
+    if not content then
+      return { error = tostring(err or "read failed"), path = path }
+    end
+    local _, newlines = content:gsub("\n", "\n")
+    local count = newlines
+    if #content > 0 and content:sub(-1) ~= "\n" then count = count + 1 end
     return {
-      tool = "workspace.snapshot",
-      label = label,
+      path = path,
+      lines = count,
+      bytes = #content,
       cwd = ctx.cwd,
       model = ctx.model,
-      provider = ctx.provider,
-      mode = ctx.mode,
-      state = ctx.state,
-      busy = ctx.busy and true or false,
-      messages = ctx.message_count,
-      prompt_tokens = ctx.prompt_tokens,
-      completion_tokens = ctx.completion_tokens,
-      total_tokens = ctx.total_tokens,
       api_version = ctx.api_version,
-      note = "Lua tools have no workspace file API in this build",
     }
   end,
 })
 
--- A convenience command so the registration can be inspected without asking a
--- model to call the tool.
 bloob.command.register("lua-tools", {
   description = "List Lua tools registered by the custom-tool example",
   run = function(ctx)

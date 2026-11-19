@@ -22,11 +22,19 @@ Not implemented yet:
 - system-wide configuration files;
 - automatic project-local `.bloob/init.lua` execution (project files are never
   loaded implicitly);
-- `--safe-mode` enforcement (the flag is parsed but does not change behavior);
-- loading local Lua modules with `require` from the config directory. The
-  runtime prepends the config directory to `package.path` **after** executing
-  `init.lua`, so a local module required during the initial execution cannot be
-  found. Keep examples self-contained for now.
+- automatic project-local plugin execution (only the trusted user plugin
+  directory is loaded);
+- a full settings schema: `bloob.setup` applies `theme`, `model` and `leader`;
+  other design-note keys are accepted but ignored.
+
+Local modules can be `require`d from the config directory: the runtime prepends
+`<config-dir>/lua/?.lua`, `<config-dir>/lua/?/init.lua` and equivalent paths to
+`package.path` **before** executing `init.lua`.
+
+`--no-config` disables user config and plugins; `--safe-mode` keeps user config
+but skips plugin loading. Project-local code is never auto-executed. User
+plugins live in `<config-dir>/plugins/<name>/plugin.lua`; see
+[plugins.md](plugins.md).
 
 `bloob.config.sources()` returns the paths that were successfully loaded.
 `bloob.config.reload()` requests the same atomic reload used by `Ctrl-R` and

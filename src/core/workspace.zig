@@ -47,9 +47,9 @@ pub const Workspace = struct {
     pub fn isSensitivePath(path: []const u8) bool {
         const base = std.fs.path.basename(path);
         const sensitive = [_][]const u8{
-            ".env", ".env.local", ".env.production", ".npmrc", ".pypirc",
-            ".netrc", ".git-credentials", "credentials", "credentials.json",
-            "id_rsa", "id_ed25519", "id_ecdsa", "known_hosts",
+            ".env",       ".env.local",       ".env.production", ".npmrc",           ".pypirc",
+            ".netrc",     ".git-credentials", "credentials",     "credentials.json", "id_rsa",
+            "id_ed25519", "id_ecdsa",         "known_hosts",
         };
         for (sensitive) |s| {
             if (std.mem.eql(u8, base, s)) return true;

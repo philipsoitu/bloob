@@ -182,24 +182,31 @@ config to isolate the problem.
 current directory. Use an absolute path to avoid surprises.
 
 **Headless output ignores my config.** `--print` and `--json` currently use a
-dedicated fixture path that does not create the Lua runtime. Use the interactive
-TUI to test configuration.
+headless runner that does not create the Lua runtime. Model selection still
+comes from `--model`/`BLOOB_*` environment variables.
 
-**Real providers do not work in `--print`.** Headless mode currently supports
-only `mock/fixture`. Real providers are used by the interactive TUI.
+**Real providers do not work in `--print`.** Real streaming providers work in
+headless mode when their API key (or compatible base URL) is configured; the
+fixture provider remains the zero-credential default.
 
 ## Current limitations
 
 - `bloob.features` reports what the Lua layer supports, not every core feature.
-  Plugins, MCP and LSP are `false`.
-- Sessions are not persisted yet. `--resume`, `--session` and `--list-sessions`
-  are placeholders.
-- Project config trust, `--safe-mode`, plugin loading, async Lua APIs and
-  storage are not implemented.
-- Key chords are not implemented. See [keymaps.md](keymaps.md).
-- Lua tools cannot read or write workspace files yet. See
+  Basic trusted user plugin loading is available; MCP and LSP are not.
+- Sessions are persisted as append-only JSONL and can be resumed, listed and
+  deleted with `--resume`, `--session`, `--list-sessions` and
+  `--delete-session`. Headless mode does not create a session yet.
+- Project-local config/plugins are never auto-loaded. `--safe-mode` skips user
+  plugins; `--no-config` skips both user config and plugins.
+- Key chords are not implemented. `<leader>x` specs are rejected rather than
+  silently treated as a bare leader key. See [keymaps.md](keymaps.md).
+- Lua tools can use `ctx:read_file(path)` (checked by the Zig workspace policy),
+  but the custom-tool execution surface is intentionally small. See
   [security.md](security.md).
+- Visual mode, rich dialogs, async Lua tasks, context compaction, subagents,
+  strategies, MCP, LSP and Tree-sitter remain future work.
 
 For the full API, continue with [configuration.md](configuration.md),
 [lua-api.md](lua-api.md), [ui-components.md](ui-components.md),
-[keymaps.md](keymaps.md), [events.md](events.md) and [security.md](security.md).
+[keymaps.md](keymaps.md), [events.md](events.md), [plugins.md](plugins.md) and
+[security.md](security.md).

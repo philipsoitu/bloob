@@ -36,7 +36,8 @@ What is missing:
 
 - `--safe-mode` is parsed but currently has no effect.
 - There is no project-config trust prompt or allow-list.
-- There are no third-party plugins yet (`bloob.features.plugins = false`).
+- User plugins are loaded only from the trusted config directory; `--safe-mode`
+  and `--no-config` skip them. Project plugins are never auto-loaded.
 - There is no signature verification, audit trail or Lua sandbox.
 - Config-local module loading is not actually available during the initial load
   because `package.path` is extended after execution; do not rely on it.
@@ -121,10 +122,9 @@ arbitrary Lua/FFI work because config code is trusted.
   access.
 - Arguments come from the model and are untrusted data. Do not treat them as
   code, file paths to trust, or shell fragments without your own validation.
-- There is no public `ctx:read_file`/`ctx:write_file` API yet. Do not use the
-  private `bloob._read_file`: its host implementation reads from the process
-  working directory without the workspace/sensitive-path checks used by the
-  native `read_file` tool. It is an internal bridge, not a security boundary.
+- `ctx:read_file(path)` is public for custom tools and uses the same workspace
+  resolver, sensitive-path denial and 256 KiB bound as the native read tool.
+  There is no `ctx:write_file`; use a native write tool or a future explicit API.
 - Tool results are inserted into the conversation as text and should be treated
   as untrusted by the model and UI.
 
@@ -165,13 +165,25 @@ traffic.
 
 ## Headless and persistence
 
-- `--print` does not create the Lua runtime, does not load config and currently
-  supports only the mock/fixture provider.
-- There are no sessions, transcripts or JSONL persistence yet, so there is no
-  stored-history exposure to audit or delete.
+- `--print` and `--json` do not create the Lua runtime or load Lua config. They
+  stream from the fixture or a configured real provider. Approval-gated tools
+  (writes, shell, non-read custom tools) are denied by default in headless mode;
+  read-only built-in tools may run automatically.
+- Sessions are stored as append-only JSONL under
+  `$XDG_DATA_HOME/bloob/sessions` (fallback
+  `~/.local/share/bloob/sessions`) with 0700 directories and 0600 files. They
+  contain prompts, model output and tool results; delete them with
+  `--delete-session ID`. No API secrets are written to sessions.
+- Resuming a session never replays side-effecting tool calls. Interrupted
+  streaming messages are marked and cannot be re-executed automatically.
+- Provider API keys are read from environment variables and passed to curl in a
+  temporary 0600 config file, removed on teardown. They are not written to
+  sessions or logs, but local processes running as the same user can read the
+  environment/temporary file. Do not run bloob on a shared account with
+  credentials you do not want that account to access.
 - Approval interaction exists only in the interactive TUI. Do not assume that a
-  headless or future automation path enforces the same approval policy until it
-  is implemented and documented.
+  headless or automation path enforces the same approval policy until it is
+  implemented and documented.
 
 ## Hardening checklist
 

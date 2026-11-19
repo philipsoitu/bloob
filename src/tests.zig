@@ -12,6 +12,7 @@ test {
     _ = @import("core/workspace.zig");
     _ = @import("tools/permissions.zig");
     _ = @import("tools/tools.zig");
+    _ = @import("tools/shell_job.zig");
     _ = @import("providers/stream.zig");
     _ = @import("providers/request.zig");
     _ = @import("providers/registry.zig");

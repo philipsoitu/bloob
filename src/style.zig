@@ -140,11 +140,11 @@ pub const Palette = struct {
     }
 
     pub fn get(self: *const Palette, s: Semantic) ?Rgb {
-        return self.colors[@intFromEnum(s)];
+        return self.colors[@backingInt(s)];
     }
 
     pub fn set(self: *Palette, s: Semantic, color: ?Rgb) void {
-        self.colors[@intFromEnum(s)] = color;
+        self.colors[@backingInt(s)] = color;
     }
 
     pub fn empty() Palette {
@@ -200,11 +200,11 @@ fn ansi16ToRgb(n: u8) Rgb {
 
 pub fn parseAnsiName(name: []const u8) ?Rgb {
     const pair = [_]struct { []const u8, Rgb }{
-        .{ "black", ansi16ToRgb(0) },     .{ "red", ansi16ToRgb(9) },
-        .{ "green", ansi16ToRgb(10) },    .{ "yellow", ansi16ToRgb(11) },
-        .{ "blue", ansi16ToRgb(12) },     .{ "magenta", ansi16ToRgb(13) },
-        .{ "cyan", ansi16ToRgb(14) },     .{ "white", ansi16ToRgb(15) },
-        .{ "gray", ansi16ToRgb(8) },      .{ "grey", ansi16ToRgb(8) },
+        .{ "black", ansi16ToRgb(0) },        .{ "red", ansi16ToRgb(9) },
+        .{ "green", ansi16ToRgb(10) },       .{ "yellow", ansi16ToRgb(11) },
+        .{ "blue", ansi16ToRgb(12) },        .{ "magenta", ansi16ToRgb(13) },
+        .{ "cyan", ansi16ToRgb(14) },        .{ "white", ansi16ToRgb(15) },
+        .{ "gray", ansi16ToRgb(8) },         .{ "grey", ansi16ToRgb(8) },
         .{ "bright_black", ansi16ToRgb(8) },
     };
     for (pair) |p| {
