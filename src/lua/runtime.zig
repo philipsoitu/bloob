@@ -626,12 +626,12 @@ pub const Runtime = struct {
         return null;
     }
 
-    pub fn invokeTool(self: *Runtime, tool: *LuaTool, args_json: []const u8) ?[]u8 {
+    pub fn invokeTool(self: *Runtime, tool: *LuaTool, args_json: []const u8, ctx: WidgetContext) ?[]u8 {
         const L = self.L;
         const top = util.top(L);
         defer util.setTop(L, top);
         util.pushRef(L, tool.run_ref);
-        self.pushWidgetCtx(.{});
+        self.pushWidgetCtx(ctx);
         var parsed = std.json.parseFromSlice(std.json.Value, self.gpa, args_json, .{}) catch {
             util.newTable(L);
             util.pcall(L, 2, 1, null, self.gpa) catch return null;

@@ -218,7 +218,7 @@ test "lua custom tool registration and ctx read_file" {
         \\})
     , "=tool");
     const tool = rt.toolByName("echo_path") orelse return error.MissingTool;
-    const out = rt.invokeTool(tool, "{\"path\":\"src/main.zig\"}") orelse return error.ToolFailed;
+    const out = rt.invokeTool(tool, "{\"path\":\"src/main.zig\"}", .{}) orelse return error.ToolFailed;
     defer std.testing.allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"path\":\"src/main.zig\"") != null);
     try std.testing.expect(rt.tools.items.len == 1);
@@ -266,7 +266,7 @@ test "serialize custom tool result with numeric keys" {
         \\})
     , "=tool");
     const tool = rt.toolByName("numeric") orelse return error.MissingTool;
-    const out = rt.invokeTool(tool, "{}") orelse return error.ToolFailed;
+    const out = rt.invokeTool(tool, "{}", .{}) orelse return error.ToolFailed;
     defer std.testing.allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"2\":\"a\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"4\":\"b\"") != null);

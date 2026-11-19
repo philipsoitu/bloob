@@ -1448,7 +1448,7 @@ pub const App = struct {
             self.appendToolMessage(call, content, res.is_error);
         } else if (self.lua) |l| {
             if (l.toolByName(call.name)) |lt| {
-                const out = l.invokeTool(lt, call.args);
+                const out = l.invokeTool(lt, call.args, self.snapshot());
                 if (out) |json| {
                     defer self.gpa.free(json);
                     self.appendToolMessage(call, json, false);

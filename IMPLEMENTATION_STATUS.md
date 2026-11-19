@@ -236,3 +236,6 @@ Manual checks:
    richer diff navigation.
 5. Add session export JSON, retention/cleanup and cross-process locking.
 6. Run ReleaseSafe/ReleaseFast and a clean-home acceptance scenario.
+- Custom Lua tool end-to-end with a real model: `workspace.count_lines` was
+  advertised, invoked, executed through `ctx:read_file`, returned
+  `{"lines":98,...}`, and the model answered from the tool result.
