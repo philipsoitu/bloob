@@ -3,6 +3,7 @@ const env = @import("env.zig");
 const cli_mod = @import("cli.zig");
 const term = @import("term.zig");
 const app_mod = @import("app.zig");
+const headless = @import("headless.zig");
 
 const version = "0.1.0";
 const lua_version = "LuaJIT 2.1";
@@ -196,15 +197,21 @@ pub fn main(process_init: std.process.Init) !u8 {
     }
     if (cli.print) |prompt| {
         const model = cli.model orelse "mock/fixture";
-        if (std.mem.startsWith(u8, model, "mock/") or std.mem.startsWith(u8, model, "fixture/")) {
-            try printMock(process_init, prompt, cli.json);
-            return 0;
-        }
-        var buf: [4096]u8 = undefined;
-        var w = stdoutWriter(process_init, &buf);
-        try w.interface.print("bloob: provider '{s}' is not wired yet in this build; use --model mock/fixture\n", .{model});
-        try w.interface.flush();
-        return 1;
+        headless.run(process_init.io, process_init.gpa, .{
+            .model = model,
+            .prompt = prompt,
+            .cwd = cli.cwd orelse (env.get("PWD") orelse "."),
+            .json = cli.json,
+        }) catch |err| {
+            if (err != error.ProviderConfiguration and err != error.ProviderError) {
+                var buf: [4096]u8 = undefined;
+                var w = stdoutWriter(process_init, &buf);
+                try w.interface.print("bloob: {s}\n",  .{@errorName(err)});
+                try w.interface.flush();
+            }
+            return 1;
+        };
+        return 0;
     }
     // Interactive TUI.
     var terminal = term.Terminal.init() catch |err| {

@@ -3,6 +3,7 @@
 //! protocol parsing lives here; the agent/UI consume a normalized accumulator.
 const std = @import("std");
 const messages = @import("../messages.zig");
+const sys = @import("../c.zig").sys;
 
 pub const Kind = enum { openai, anthropic };
 
@@ -132,6 +133,8 @@ pub const Stream = struct {
         // wait/kill do not double-close.
         self.child.stdout = null;
         self.child.stderr = null;
+        if (self.stdout) |f| _ = sys.fcntl(f.handle, sys.F_SETFL, sys.O_NONBLOCK);
+        if (self.stderr) |f| _ = sys.fcntl(f.handle, sys.F_SETFL, sys.O_NONBLOCK);
         return self;
     }
 
@@ -139,7 +142,6 @@ pub const Stream = struct {
         self.closeFiles();
         if (!self.waited) {
             self.child.kill(self.io);
-            _ = self.child.wait(self.io) catch {};
             self.waited = true;
         }
         self.line.deinit(self.gpa);
@@ -170,25 +172,27 @@ pub const Stream = struct {
 
     pub fn pump(self: *Stream) void {
         if (self.stdout) |f| {
-            const n = std.posix.read(f.handle, &self.read_buf) catch |err| switch (err) {
-                error.WouldBlock => 0,
+            const read_result: ?usize = std.posix.read(f.handle, &self.read_buf) catch |err| switch (err) {
+                error.WouldBlock => null,
                 else => blk: {
                     self.acc.setError(@errorName(err));
                     self.eof_stdout = true;
-                    break :blk 0;
+                    break :blk null;
                 },
             };
-            if (n == 0) {
-                if (!self.eof_stdout) {
-                    self.eof_stdout = true;
-                    if (self.stdout) |sf| {
-                        sf.close(self.io);
-                        self.stdout = null;
+            if (read_result) |n| {
+                if (n == 0) {
+                    if (!self.eof_stdout) {
+                        self.eof_stdout = true;
+                        if (self.stdout) |sf| {
+                            sf.close(self.io);
+                            self.stdout = null;
+                        }
+                        self.flushLine();
                     }
-                    self.flushLine();
+                } else {
+                    self.consumeBytes(self.read_buf[0..n]);
                 }
-            } else {
-                self.consumeBytes(self.read_buf[0..n]);
             }
         }
         if (self.stderr) |f| {

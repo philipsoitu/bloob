@@ -15,4 +15,5 @@ test {
     _ = @import("providers/stream.zig");
     _ = @import("providers/request.zig");
     _ = @import("providers/registry.zig");
+    _ = @import("headless.zig");
 }
