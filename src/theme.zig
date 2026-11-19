@@ -150,8 +150,9 @@ pub const Registry = struct {
     pub fn register(self: *Registry, theme_name: []const u8, pal: Palette) !void {
         const owned = try self.gpa.dupe(u8, theme_name);
         errdefer self.gpa.free(owned);
-        try self.themes.put(owned, pal);
         try self.custom_names.append(self.gpa, owned);
+        errdefer _ = self.custom_names.pop();
+        try self.themes.put(owned, pal);
     }
 
     pub fn palette(self: *Registry) Palette {

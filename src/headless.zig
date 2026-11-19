@@ -27,9 +27,19 @@ const Out = struct {
         try std.Io.File.stdout().writeStreamingAll(self.io, bytes);
     }
 
-    fn eventStart(self: *Out) !void {
+    fn eventStart(self: *Out, model: []const u8) !void {
         if (!self.json) return;
-        try self.write("{\"type\":\"start\",\"provider\":null}\n");
+        const slash = std.mem.indexOfScalar(u8, model, '/');
+        const provider = if (slash) |i| model[0..i] else model;
+        const model_id = if (slash) |i| model[i + 1 ..] else "";
+        var out = std.ArrayList(u8).empty;
+        defer out.deinit(std.heap.page_allocator);
+        try out.appendSlice(std.heap.page_allocator, "{\"type\":\"start\",\"provider\":");
+        try appendJson(std.heap.page_allocator, &out, provider);
+        try out.appendSlice(std.heap.page_allocator, ",\"model\":");
+        try appendJson(std.heap.page_allocator, &out, model_id);
+        try out.appendSlice(std.heap.page_allocator, "}\n");
+        try self.write(out.items);
     }
 
     fn textDelta(self: *Out, text: []const u8) !void {
@@ -153,7 +163,7 @@ pub fn run(init: std.Io, gpa: std.mem.Allocator, opts: Options) !void {
     defer conv.deinit();
     _ = try conv.add(.user, opts.prompt, 0);
     if (registry.isMock(opts.model)) {
-        try out.eventStart();
+        try out.eventStart(opts.model);
         const text = try std.fmt.allocPrint(gpa,
             "[mock/fixture — deterministic offline output; no model was contacted]\n\nDeterministic fixture response.\nprompt: {s}\n", .{opts.prompt});
         defer gpa.free(text);
@@ -184,7 +194,7 @@ pub fn run(init: std.Io, gpa: std.mem.Allocator, opts: Options) !void {
     defer gpa.free(schemas);
     const system = try prompts.systemPrompt(gpa, workspace.root);
     defer gpa.free(system);
-    try out.eventStart();
+    try out.eventStart(opts.model);
     var iter: u32 = 0;
     while (iter < opts.max_iterations) : (iter += 1) {
         const body = switch (resolved.kind) {

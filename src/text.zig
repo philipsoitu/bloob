@@ -282,8 +282,23 @@ pub fn sanitizeInto(out: *std.ArrayList(u8), gpa: std.mem.Allocator, input: []co
             i += 1;
             continue;
         }
-        try out.append(gpa, b);
-        i += 1;
+        if (b < 0x80) {
+            try out.append(gpa, b);
+            i += 1;
+            continue;
+        }
+        const d = decode(input, i);
+        if (d.len == 0) {
+            i += 1;
+            continue;
+        }
+        if (d.len == 1 and d.cp == replacement) {
+            try out.appendSlice(gpa, "�");
+            i += 1;
+            continue;
+        }
+        try out.appendSlice(gpa, input[i .. i + d.len]);
+        i += d.len;
     }
 }
 
@@ -314,4 +329,37 @@ test "sanitize strips escape injection" {
     const result = try sanitizeAlloc(gpa, "hi\x1b]0;pwned\x07 there\x1b[31m!", 1024);
     defer gpa.free(result);
     try std.testing.expectEqualStrings("hi there!", result);
+}
+
+/// Skip one ANSI escape sequence starting at ESC. Returns the index just past it.
+pub fn skipAnsiSequence(bytes: []const u8, index: usize) usize {
+    if (index >= bytes.len or bytes[index] != 0x1b) return index;
+    var i = index + 1;
+    if (i >= bytes.len) return i;
+    switch (bytes[i]) {
+        '[' => {
+            i += 1;
+            while (i < bytes.len) : (i += 1) {
+                if (bytes[i] >= 0x40 and bytes[i] <= 0x7E) return i + 1;
+            }
+            return i;
+        },
+        ']', 'P', 'X', '^', '_' => {
+            i += 1;
+            while (i < bytes.len) : (i += 1) {
+                if (bytes[i] == 0x07) return i + 1;
+                if (bytes[i] == 0x1b and i + 1 < bytes.len and bytes[i + 1] == '\\') return i + 2;
+            }
+            return i;
+        },
+        else => return i + 1,
+    }
+}
+
+test "sanitize repairs invalid UTF-8" {
+    const gpa = std.testing.allocator;
+    const result = try sanitizeAlloc(gpa, "ok\xffbad", 1024);
+    defer gpa.free(result);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(result));
+    try std.testing.expect(std.mem.startsWith(u8, result, "ok"));
 }

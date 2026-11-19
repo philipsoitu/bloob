@@ -46,6 +46,7 @@ pub const Accumulator = struct {
     }
 
     fn ensureTool(self: *Accumulator, index: usize) !*PartialToolCall {
+        if (index > 64) return error.TooManyToolCalls;
         while (self.tool_calls.items.len <= index) {
             try self.tool_calls.append(self.gpa, .{});
         }
@@ -78,7 +79,9 @@ pub const Stream = struct {
     acc: Accumulator,
     eof_stdout: bool = false,
     eof_stderr: bool = false,
+    skip_line: bool = false,
     waited: bool = false,
+    config_path: ?[]u8 = null,
     read_buf: [8192]u8 = undefined,
 
     pub fn start(
@@ -89,23 +92,50 @@ pub const Stream = struct {
         api_key: []const u8,
         body: []const u8,
     ) !*Stream {
-        var argv = std.ArrayList([]const u8).empty;
-        defer argv.deinit(gpa);
-        try argv.appendSlice(gpa, &.{
-            "curl", "--silent", "--show-error", "--no-buffer", "--fail-with-body",
-            "-X", "POST", url,
-            "-H", "Content-Type: application/json",
-        });
-        var auth_buf: [8192]u8 = undefined;
-        const auth = switch (kind) {
-            .openai => std.fmt.bufPrint(&auth_buf, "Authorization: Bearer {s}", .{api_key}) catch return error.InvalidApiKey,
-            .anthropic => std.fmt.bufPrint(&auth_buf, "x-api-key: {s}", .{api_key}) catch return error.InvalidApiKey,
+        if (!std.mem.startsWith(u8, url, "https://") and !std.mem.startsWith(u8, url, "http://")) return error.InvalidUrl;
+        if (std.mem.indexOfAny(u8, url, "\"\r\n") != null or std.mem.startsWith(u8, url, "-")) return error.InvalidUrl;
+        if (std.mem.indexOfAny(u8, api_key, "\"\r\n") != null) return error.InvalidApiKey;
+        const runtime_dir = @import("../env.zig").get("XDG_RUNTIME_DIR") orelse @import("../env.zig").get("TMPDIR") orelse "/tmp";
+        const stamp = std.Io.Clock.real.now(io).toMilliseconds();
+        const pid: i64 = if (@import("builtin").os.tag == .linux) @intCast(std.os.linux.getpid()) else 0;
+        const config_path = try std.fmt.allocPrint(gpa, "{s}/bloob-curl-{d}-{d}.conf", .{ runtime_dir, pid, stamp });
+        errdefer gpa.free(config_path);
+        const proto = if (std.mem.startsWith(u8, url, "https://")) "=https" else "=http";
+        var cfg = std.ArrayList(u8).empty;
+        defer cfg.deinit(gpa);
+        const head = try std.fmt.allocPrint(gpa,
+            "url = \"{s}\"\nrequest = \"POST\"\nsilent\nshow-error\nno-buffer\nfail-with-body\nproto = \"{s}\"\nmax-time = 300\nconnect-timeout = 20\nheader = \"Content-Type: application/json\"\n",
+            .{ url, proto },
+        );
+        defer gpa.free(head);
+        try cfg.appendSlice(gpa, head);
+        switch (kind) {
+            .openai => {
+                const line = try std.fmt.allocPrint(gpa, "header = \"Authorization: Bearer {s}\"\n", .{api_key});
+                defer gpa.free(line);
+                try cfg.appendSlice(gpa, line);
+            },
+            .anthropic => {
+                const line = try std.fmt.allocPrint(gpa, "header = \"x-api-key: {s}\"\n", .{api_key});
+                defer gpa.free(line);
+                try cfg.appendSlice(gpa, line);
+                try cfg.appendSlice(gpa, "header = \"anthropic-version: 2023-06-01\"\n");
+            },
+        }
+        try cfg.appendSlice(gpa, "data-binary = \"@-\"\n");
+        const private_permissions: std.Io.File.Permissions = @enumFromInt(0o600);
+        std.Io.Dir.cwd().writeFile(io, .{
+            .sub_path = config_path,
+            .data = cfg.items,
+            .flags = .{ .permissions = private_permissions },
+        }) catch |err| {
+            gpa.free(config_path);
+            return err;
         };
-        try argv.appendSlice(gpa, &.{ "-H", auth });
-        if (kind == .anthropic) try argv.appendSlice(gpa, &.{ "-H", "anthropic-version: 2023-06-01" });
-        try argv.appendSlice(gpa, &.{ "-d", "@-" });
+        errdefer std.Io.Dir.cwd().deleteFile(io, config_path) catch {};
+        const argv = [_][]const u8{ "curl", "--config", config_path };
         var child = try std.process.spawn(io, .{
-            .argv = argv.items,
+            .argv = &argv,
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = .pipe,
@@ -114,6 +144,7 @@ pub const Stream = struct {
         if (child.stdin) |in| {
             in.writeStreamingAll(io, body) catch |err| {
                 child.kill(io);
+                gpa.free(config_path);
                 return err;
             };
             in.close(io);
@@ -128,6 +159,7 @@ pub const Stream = struct {
             .stdout = child.stdout,
             .stderr = child.stderr,
             .acc = Accumulator.init(gpa),
+            .config_path = config_path,
         };
         // Ownership moved to our optional fields; null them on the child so
         // wait/kill do not double-close.
@@ -137,12 +169,16 @@ pub const Stream = struct {
         if (self.stderr) |f| _ = sys.fcntl(f.handle, sys.F_SETFL, sys.O_NONBLOCK);
         return self;
     }
-
     pub fn deinit(self: *Stream) void {
         self.closeFiles();
         if (!self.waited) {
             self.child.kill(self.io);
             self.waited = true;
+        }
+        if (self.config_path) |p| {
+            std.Io.Dir.cwd().deleteFile(self.io, p) catch {};
+            self.gpa.free(p);
+            self.config_path = null;
         }
         self.line.deinit(self.gpa);
         self.stderr_buf.deinit(self.gpa);
@@ -249,10 +285,19 @@ pub const Stream = struct {
     fn consumeBytes(self: *Stream, bytes: []const u8) void {
         for (bytes) |b| {
             if (b == '\n') {
+                if (self.skip_line) {
+                    self.skip_line = false;
+                    self.line.clearRetainingCapacity();
+                    continue;
+                }
                 self.processLine(self.line.items);
                 self.line.clearRetainingCapacity();
-            } else {
-                if (self.line.items.len < 1024 * 1024) self.line.append(self.gpa, b) catch {};
+            } else if (!self.skip_line) {
+                if (self.line.items.len >= 1024 * 1024) {
+                    self.skip_line = true;
+                    self.line.clearRetainingCapacity();
+                    self.acc.setError("provider event line exceeds 1 MiB");
+                } else self.line.append(self.gpa, b) catch {};
             }
         }
     }
@@ -306,11 +351,11 @@ pub const Stream = struct {
             if (uv == .object) {
                 const u = uv.object;
                 if (jsonInt(u, "prompt_tokens")) |n| {
-                    self.acc.usage.prompt_tokens = @intCast(n);
+                    self.acc.usage.prompt_tokens = std.math.cast(u64, n) orelse std.math.maxInt(u64);
                     self.acc.usage.reported = true;
                 }
                 if (jsonInt(u, "completion_tokens")) |n| {
-                    self.acc.usage.completion_tokens = @intCast(n);
+                    self.acc.usage.completion_tokens = std.math.cast(u64, n) orelse std.math.maxInt(u64);
                     self.acc.usage.reported = true;
                 }
             }
@@ -336,7 +381,7 @@ pub const Stream = struct {
         for (tcs.items) |tcv| {
             if (tcv != .object) continue;
             const tc = tcv.object;
-            const index: usize = if (jsonInt(tc, "index")) |iv| @intCast(@max(0, iv)) else 0;
+            const index: usize = if (jsonInt(tc, "index")) |iv| @intCast(std.math.clamp(iv, 0, 64)) else 0;
             const partial = self.acc.ensureTool(index) catch continue;
             if (jsonString(tc, "id")) |idv| partial.id.appendSlice(self.gpa, idv) catch {};
             if (tc.get("function")) |fv| {
@@ -367,7 +412,7 @@ pub const Stream = struct {
                     if (mv.object.get("usage")) |uv| {
                         if (uv == .object) {
                             if (jsonInt(uv.object, "input_tokens")) |n| {
-                                self.acc.usage.prompt_tokens = @intCast(n);
+                                self.acc.usage.prompt_tokens = std.math.cast(u64, n) orelse std.math.maxInt(u64);
                                 self.acc.usage.reported = true;
                             }
                         }
@@ -377,7 +422,7 @@ pub const Stream = struct {
             return;
         }
         if (std.mem.eql(u8, typ, "content_block_start")) {
-            const idx: usize = if (jsonInt(obj, "index")) |iv| @intCast(@max(0, iv)) else 0;
+            const idx: usize = if (jsonInt(obj, "index")) |iv| @intCast(std.math.clamp(iv, 0, 64)) else 0;
             if (obj.get("content_block")) |cb| {
                 if (cb == .object) {
                     const block = cb.object;
@@ -392,7 +437,7 @@ pub const Stream = struct {
             return;
         }
         if (std.mem.eql(u8, typ, "content_block_delta")) {
-            const idx: usize = if (jsonInt(obj, "index")) |iv| @intCast(@max(0, iv)) else 0;
+            const idx: usize = if (jsonInt(obj, "index")) |iv| @intCast(std.math.clamp(iv, 0, 64)) else 0;
             if (obj.get("delta")) |dv| {
                 if (dv == .object) {
                     const d = dv.object;
@@ -416,7 +461,7 @@ pub const Stream = struct {
             if (obj.get("usage")) |uv| {
                 if (uv == .object) {
                     if (jsonInt(uv.object, "output_tokens")) |n| {
-                        self.acc.usage.completion_tokens = @intCast(n);
+                        self.acc.usage.completion_tokens = std.math.cast(u64, n) orelse std.math.maxInt(u64);
                         self.acc.usage.reported = true;
                     }
                 }

@@ -4,6 +4,7 @@ const cli_mod = @import("cli.zig");
 const term = @import("term.zig");
 const app_mod = @import("app.zig");
 const headless = @import("headless.zig");
+const ui = @import("ui/node.zig");
 const sessions_store = @import("sessions/store.zig");
 
 const version = "0.1.0";
@@ -17,6 +18,9 @@ fn writeStdout(init: std.process.Init, bytes: []const u8) !void {
     var buf: [4096]u8 = undefined;
     var w = stdoutWriter(init, &buf);
     try w.interface.writeAll(bytes);
+    if (env.get("BLOOB_COMPAT_BASE_URL") != null) {
+        try w.interface.writeAll("  compat/*              OpenAI-compatible endpoint configured via BLOOB_COMPAT_BASE_URL\n");
+    }
     try w.interface.flush();
 }
 
@@ -56,6 +60,12 @@ fn doctor(init: std.process.Init) !void {
     var buf: [16384]u8 = undefined;
     var w = stdoutWriter(init, &buf);
     const is_tty = term.Terminal.isTty(std.posix.STDIN_FILENO) and term.Terminal.isTty(std.posix.STDOUT_FILENO);
+    const cfg_path = userConfigPath(init.gpa) catch null;
+    defer if (cfg_path) |p| init.gpa.free(p);
+    const cfg_exists = if (cfg_path) |p| blk: {
+        std.Io.Dir.cwd().access(init.io, p, .{}) catch break :blk false;
+        break :blk true;
+    } else false;
     try w.interface.print(
         \\bloob doctor
         \\  version:           {s}
@@ -80,8 +90,8 @@ fn doctor(init: std.process.Init) !void {
         env.get("TERM") orelse "(unset)",
         env.get("COLORTERM") orelse "(unset)",
         env.get("PWD") orelse ".",
-        env.get("XDG_CONFIG_HOME") orelse "(XDG_CONFIG_HOME unset)",
-        "checked at runtime by the Lua runtime",
+        cfg_path orelse "(none)",
+        if (cfg_exists) "yes" else "no",
         env.get("XDG_DATA_HOME") orelse "(XDG_DATA_HOME unset)",
         if (env.get("OPENAI_API_KEY") != null) "set" else "unset",
         if (env.get("ANTHROPIC_API_KEY") != null) "set" else "unset",
@@ -166,6 +176,12 @@ fn jsonEscape(buf: []u8, s: []const u8) ![]const u8 {
 pub fn main(process_init: std.process.Init) !u8 {
     var cli = try cli_mod.parse(process_init);
     defer cli.deinit(process_init.gpa);
+    var cwd_owned: ?[:0]u8 = null;
+    defer if (cwd_owned) |p| process_init.gpa.free(p);
+    const cwd = cli.cwd orelse blk: {
+        cwd_owned = std.process.currentPathAlloc(process_init.io, process_init.gpa) catch null;
+        break :blk if (cwd_owned) |p| p else ".";
+    };
     if (cli.errors.items.len > 0) {
         var buf: [8192]u8 = undefined;
         var w = stdoutWriter(process_init, &buf);
@@ -192,22 +208,41 @@ pub fn main(process_init: std.process.Init) !u8 {
         try listSessions(process_init);
         return 0;
     }
+    if (cli.delete_session) |id| {
+        try deleteSession(process_init, id);
+        return 0;
+    }
     if (cli.doctor) {
         try doctor(process_init);
         return 0;
     }
-    if (cli.print) |prompt| {
+    if (cli.self_test) {
+        try selfTest(process_init, cwd);
+        return 0;
+    }
+    if (cli.print) |prompt_arg| {
         const model = cli.model orelse "mock/fixture";
+        var prompt_owned: ?[]u8 = null;
+        defer if (prompt_owned) |p| process_init.gpa.free(p);
+        var prompt = prompt_arg;
+        if (prompt.len == 0 and !term.Terminal.isTty(std.posix.STDIN_FILENO)) {
+            var stdin_buf: [4096]u8 = undefined;
+            var reader = std.Io.File.stdin().reader(process_init.io, &stdin_buf);
+            prompt_owned = reader.interface.allocRemaining(process_init.gpa, .limited(1024 * 1024)) catch null;
+            if (prompt_owned) |p| {
+                prompt = p;
+            }
+        }
         headless.run(process_init.io, process_init.gpa, .{
             .model = model,
             .prompt = prompt,
-            .cwd = cli.cwd orelse (env.get("PWD") orelse "."),
+            .cwd = cwd,
             .json = cli.json,
         }) catch |err| {
             if (err != error.ProviderConfiguration and err != error.ProviderError) {
                 var buf: [4096]u8 = undefined;
                 var w = stdoutWriter(process_init, &buf);
-                try w.interface.print("bloob: {s}\n",  .{@errorName(err)});
+                try w.interface.print("bloob: {s}\n", .{@errorName(err)});
                 try w.interface.flush();
             }
             return 1;
@@ -225,7 +260,7 @@ pub fn main(process_init: std.process.Init) !u8 {
     defer terminal.deinit();
     var app = try app_mod.App.init(process_init.gpa, process_init.io, &terminal, .{
         .model = cli.model,
-        .cwd = cli.cwd orelse (env.get("PWD") orelse "."),
+        .cwd = cwd,
     });
     defer app.deinit();
     app.initLua(cli.config, cli.no_config);
@@ -284,4 +319,71 @@ fn listSessions(init: std.process.Init) !void {
         }
     }
     try w.interface.flush();
+}
+
+fn deleteSession(init: std.process.Init, id: []const u8) !void {
+    const dir = sessions_store.defaultDataDir(init.gpa, init.environ_map) catch |err| {
+        var buf: [4096]u8 = undefined;
+        var w = stdoutWriter(init, &buf);
+        try w.interface.print("bloob: session storage unavailable: {s}\n", .{@errorName(err)});
+        try w.interface.flush();
+        return;
+    };
+    defer init.gpa.free(dir);
+    var store = sessions_store.Store.init(init.gpa, init.io, dir) catch |err| {
+        var buf: [4096]u8 = undefined;
+        var w = stdoutWriter(init, &buf);
+        try w.interface.print("bloob: session storage unavailable: {s}\n", .{@errorName(err)});
+        try w.interface.flush();
+        return;
+    };
+    defer store.deinit();
+    store.delete(id) catch |err| {
+        var buf: [4096]u8 = undefined;
+        var w = stdoutWriter(init, &buf);
+        try w.interface.print("bloob: cannot delete session: {s}\n", .{@errorName(err)});
+        try w.interface.flush();
+        return;
+    };
+    var buf: [4096]u8 = undefined;
+    var w = stdoutWriter(init, &buf);
+    try w.interface.print("Deleted session {s}\n", .{id});
+    try w.interface.flush();
+}
+
+fn selfTest(init: std.process.Init, cwd: []const u8) !void {
+    var fake_terminal = term.Terminal{};
+    var app = try app_mod.App.init(init.gpa, init.io, &fake_terminal, .{ .cwd = cwd, .model = "mock/fixture" });
+    defer app.deinit();
+    app.initLua(null, true);
+    const rt = app.lua orelse {
+        try writeStdout(init, "self-test: FAIL (Lua runtime unavailable)\n");
+        return error.SelfTestFailed;
+    };
+    var arena = std.heap.ArenaAllocator.init(init.gpa);
+    defer arena.deinit();
+    const layout = rt.buildLayout(arena.allocator(), app.snapshot()) catch {
+        var buf: [4096]u8 = undefined;
+        var w = stdoutWriter(init, &buf);
+        try w.interface.print("self-test: FAIL (layout: {s})\n", .{rt.lastError()});
+        try w.interface.flush();
+        return error.SelfTestFailed;
+    };
+    ui.prepare(layout, .{ .x = 0, .y = 0, .w = 100, .h = 30 });
+    var buf: [4096]u8 = undefined;
+    var w = stdoutWriter(init, &buf);
+    try w.interface.print("self-test: OK (root={s}, children={d}, rect={d}x{d}, model={s})\n", .{
+        @tagName(layout.kind),
+        layout.children.len,
+        layout.rect.w,
+        layout.rect.h,
+        app.model,
+    });
+    try w.interface.flush();
+}
+
+fn userConfigPath(gpa: std.mem.Allocator) !?[]u8 {
+    if (env.get("XDG_CONFIG_HOME")) |xdg| return try std.fmt.allocPrint(gpa, "{s}/bloob/init.lua", .{xdg});
+    if (env.get("HOME")) |home| return try std.fmt.allocPrint(gpa, "{s}/.config/bloob/init.lua", .{home});
+    return null;
 }

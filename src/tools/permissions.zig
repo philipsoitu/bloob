@@ -69,15 +69,12 @@ pub const Engine = struct {
         for (req.paths) |p| {
             if (workspace_mod.Workspace.isSensitivePath(p)) return .deny;
             if (self.workspace) |ws| {
-                if (!std.mem.startsWith(u8, p, ws.root) and !std.mem.eql(u8, p, ws.root)) return .deny;
+                if (!workspace_mod.Workspace.isWithin(ws.root, p)) return .deny;
             }
         }
+        const d = self.base(req.capability);
+        if (d == .deny) return .deny;
         if (self.session_allowed.contains(req.tool)) return .allow;
-        var d = self.base(req.capability);
-        if (d == .allow and req.capability == .workspace_write) {
-            // Still ask for edits unless policy was explicitly set to allow.
-            d = .ask;
-        }
         return d;
     }
 
@@ -105,4 +102,25 @@ test "permission defaults" {
     try std.testing.expectEqual(Decision.allow, e.evaluate(.{ .tool = "read_file", .capability = .workspace_read }));
     try std.testing.expectEqual(Decision.ask, e.evaluate(.{ .tool = "shell", .capability = .shell }));
     try std.testing.expectEqual(Decision.deny, e.evaluate(.{ .tool = "read_file", .capability = .workspace_read, .paths = &.{"/home/x/.ssh/id_rsa"} }));
+}
+
+test "ground denial and sibling-prefix path safety" {
+    var e = Engine.init(std.testing.allocator);
+    defer e.deinit();
+    e.policy.read = .deny;
+    try std.testing.expectEqual(Decision.deny, e.evaluate(.{ .tool = "read_file", .capability = .workspace_read }));
+    e.allowSession("read_file");
+    try std.testing.expectEqual(Decision.deny, e.evaluate(.{ .tool = "read_file", .capability = .workspace_read }));
+    e.policy.read = .allow;
+    const ws = @import("../core/workspace.zig").Workspace{ .gpa = std.testing.allocator, .io = std.testing.io, .root = @constCast("/ws/proj") };
+    e.workspace = &ws;
+    try std.testing.expectEqual(Decision.deny, e.evaluate(.{ .tool = "read_file", .capability = .workspace_read, .paths = &.{"/ws/proj-evil/secret"} }));
+    try std.testing.expectEqual(Decision.allow, e.evaluate(.{ .tool = "read_file", .capability = .workspace_read, .paths = &.{"/ws/proj/file"} }));
+}
+
+test "explicit write allow stays allow" {
+    var e = Engine.init(std.testing.allocator);
+    defer e.deinit();
+    e.policy.write = .allow;
+    try std.testing.expectEqual(Decision.allow, e.evaluate(.{ .tool = "write_file", .capability = .workspace_write }));
 }

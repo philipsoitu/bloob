@@ -88,6 +88,7 @@ pub const Terminal = struct {
         raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
         try std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, raw);
         t.raw_enabled = true;
+        errdefer t.deinit();
         installSignals();
 
         // Alternate screen, hidden cursor, bracketed paste, SGR mouse, focus events.

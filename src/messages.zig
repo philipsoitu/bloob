@@ -53,8 +53,9 @@ pub const Message = struct {
     }
 
     pub fn setModel(self: *Message, gpa: std.mem.Allocator, model: []const u8) !void {
+        const owned = try gpa.dupe(u8, model);
         if (self.model) |old| gpa.free(old);
-        self.model = try gpa.dupe(u8, model);
+        self.model = owned;
     }
 
     pub fn addToolCall(self: *Message, gpa: std.mem.Allocator, id: []const u8, name: []const u8, args: []const u8) !void {
@@ -66,10 +67,12 @@ pub const Message = struct {
     }
 
     pub fn setToolResult(self: *Message, gpa: std.mem.Allocator, call_id: []const u8, name: []const u8, is_error: bool) !void {
+        const id = try gpa.dupe(u8, call_id);
+        const owned_name = try gpa.dupe(u8, name);
         if (self.tool_call_id) |s| gpa.free(s);
         if (self.tool_name) |s| gpa.free(s);
-        self.tool_call_id = try gpa.dupe(u8, call_id);
-        self.tool_name = try gpa.dupe(u8, name);
+        self.tool_call_id = id;
+        self.tool_name = owned_name;
         self.tool_is_error = is_error;
     }
 };

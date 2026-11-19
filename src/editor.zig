@@ -340,11 +340,7 @@ pub const Editor = struct {
                     const old = self.history.orderedRemove(0);
                     self.gpa.free(old);
                 }
-            } else {
-                self.gpa.free(value);
             }
-        } else {
-            self.gpa.free(value);
         }
         self.text.clearRetainingCapacity();
         self.cursor = 0;
@@ -476,4 +472,18 @@ test "editor basics" {
     try std.testing.expectEqual(@as(usize, 6), ed.lineStart(9));
     ed.undo();
     try std.testing.expectEqualStrings("", ed.text.items);
+}
+
+test "submit keeps ownership and handles duplicate history" {
+    var ed = Editor.init(std.testing.allocator);
+    defer ed.deinit();
+    try ed.insertText("hello", true);
+    const first = try ed.submit();
+    defer std.testing.allocator.free(first);
+    try std.testing.expectEqualStrings("hello", first);
+    try ed.insertText("hello", true);
+    const second = try ed.submit();
+    defer std.testing.allocator.free(second);
+    try std.testing.expectEqualStrings("hello", second);
+    try std.testing.expectEqual(@as(usize, 1), ed.history.items.len);
 }

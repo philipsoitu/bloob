@@ -10,6 +10,7 @@ pub const Cli = struct {
     provider: ?[]const u8 = null,
     resume_session: bool = false,
     session: ?[]const u8 = null,
+    delete_session: ?[]const u8 = null,
     print: ?[]const u8 = null,
     print_storage: std.ArrayList(u8) = .empty,
     json: bool = false,
@@ -91,6 +92,10 @@ pub fn parse(init: std.process.Init) !Cli {
             cli.resume_session = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--delete-session")) {
+            cli.delete_session = valueAt(args, &i);
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--print")) {
             if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-")) {
                 cli.print = valueAt(args, &i);
@@ -166,7 +171,9 @@ pub const help_text =
     \\  --json               With --print, emit JSON events
     \\  --list-models        List configured providers and models
     \\  --list-sessions      List saved sessions
+    \\  --delete-session ID  Delete a saved session
     \\  --doctor             Diagnose terminal, config and providers
+    \\  --self-test          Validate the noninteractive Lua UI layout
     \\  --version            Print version
     \\  --help               Print this help
     \\

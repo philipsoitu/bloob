@@ -88,6 +88,7 @@ pub const Frame = struct {
     /// Place one codepoint. Returns the number of columns used, or 0 when clipped.
     pub fn putCodepoint(self: *Frame, x: u16, y: u16, cp: u21, s: Style) u16 {
         if (y >= self.height or x >= self.width) return 0;
+        if (cp < 0x20 or (cp >= 0x7F and cp <= 0x9F)) return 0;
         const w = text.codepointWidth(cp);
         if (w == 0) {
             // Attach zero-width marks to the preceding cell when possible.
@@ -129,10 +130,24 @@ pub const Frame = struct {
         var i: usize = 0;
         const limit = x + max_cols;
         while (i < bytes.len and cx < limit and cx < self.width) {
+            if (bytes[i] == 0x1b) {
+                i = text.skipAnsiSequence(bytes, i);
+                continue;
+            }
             const d = text.decode(bytes, i);
             if (d.len == 0) break;
             i += d.len;
             if (d.cp == '\n') break;
+            if (d.cp == '\t') {
+                const spaces = 4 - (cx % 4);
+                var k: u16 = 0;
+                while (k < spaces and cx < limit) : (k += 1) {
+                    const used = self.putCodepoint(cx, y, ' ', s);
+                    if (used == 0) break;
+                    cx += used;
+                }
+                continue;
+            }
             const w = text.codepointWidth(d.cp);
             if (w == 0) {
                 _ = self.putCodepoint(cx, y, d.cp, s);
@@ -293,8 +308,8 @@ pub const Frame = struct {
     }
 
     pub fn renderToBuffer(self: *Frame, buffer: []u8, palette: *const Palette) []const u8 {
-        var fbs = std.io.fixedBufferStream(buffer);
-        const w = fbs.writer();
+        _ = palette;
+        var n: usize = 0;
         var y: u16 = 0;
         while (y < self.height) : (y += 1) {
             var x: u16 = 0;
@@ -302,13 +317,20 @@ pub const Frame = struct {
                 const cell = self.cells[@as(usize, y) * @as(usize, self.width) + @as(usize, x)];
                 if (cell.continuation) continue;
                 var b: [4]u8 = undefined;
-                w.writeAll(text.encode(cell.cp, &b)) catch break;
-                x += @intCast(text.codepointWidth(cell.cp) - 1);
+                const encoded = text.encode(cell.cp, &b);
+                if (n + encoded.len > buffer.len) return buffer[0..n];
+                @memcpy(buffer[n..][0..encoded.len], encoded);
+                n += encoded.len;
+                const cw = text.codepointWidth(cell.cp);
+                if (cw > 1) x += @intCast(cw - 1);
             }
-            if (y + 1 < self.height) w.writeByte('\n') catch break;
+            if (y + 1 < self.height) {
+                if (n >= buffer.len) break;
+                buffer[n] = '\n';
+                n += 1;
+            }
         }
-        _ = palette;
-        return fbs.getWritten();
+        return buffer[0..n];
     }
 };
 
@@ -331,4 +353,18 @@ test "frame text and wide chars" {
     try std.testing.expectEqual(@as(u21, '界'), f.cellAt(1, 0).?.cp);
     try std.testing.expect(f.cellAt(2, 0).?.continuation);
     try std.testing.expectEqual(@as(u21, 'b'), f.cellAt(3, 0).?.cp);
+}
+
+test "frame strips injected ANSI and controls" {
+    var f = try Frame.init(std.testing.allocator, 40, 2);
+    defer f.deinit();
+    f.clear(.{});
+    _ = f.putText(0, 0, "safe\x1b]0;pwned\x07 text\x1b[2J!", .{}, 40);
+    var out_buf: [4096]u8 = undefined;
+    const plain = f.renderToBuffer(&out_buf, undefined);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "pwned") == null);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "safe text!") != null);
+    const ansi = try f.toAnsi(std.testing.allocator, &@import("theme.zig").builtin_default, .mono);
+    defer std.testing.allocator.free(ansi);
+    try std.testing.expect(std.mem.indexOf(u8, ansi, "pwned") == null);
 }

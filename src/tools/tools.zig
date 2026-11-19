@@ -124,7 +124,7 @@ fn resultError(gpa: std.mem.Allocator, summary: []const u8, detail: []const u8) 
     };
 }
 
-fn resultOk(gpa: std.mem.Allocator, summary: []const u8, content: []u8) Result {
+fn resultOk(gpa: std.mem.Allocator, summary: []const u8, content: []const u8) Result {
     _ = gpa;
     return .{ .content = content, .summary = summary };
 }
@@ -169,7 +169,7 @@ pub fn execute(ctx: ToolContext, name: []const u8, args_json: []const u8) Result
     if (std.mem.eql(u8, name, "write_file")) return writeFile(ctx, root);
     if (std.mem.eql(u8, name, "edit_file")) return editFile(ctx, root);
     if (std.mem.eql(u8, name, "shell")) return shell(ctx, root);
-    if (std.mem.eql(u8, name, "git_status")) return gitCommand(ctx, &.{ "status", "--short", "--branch" }, "git status");
+    if (std.mem.eql(u8, name, "git_status")) return gitCommand(ctx, &.{ "status", "--short", "--branch" }, "git status", 256 * 1024);
     if (std.mem.eql(u8, name, "git_diff")) return gitDiff(ctx, root);
     if (std.mem.eql(u8, name, "git_log")) return gitLog(ctx, root);
     return resultError(ctx.gpa, name, "unknown tool");
@@ -266,34 +266,118 @@ fn shouldIgnore(path: []const u8) bool {
     return false;
 }
 
-fn captureProcess(ctx: ToolContext, argv: []const []const u8, cwd: ?[]const u8, max_bytes: usize) !struct { output: []u8, term: std.process.Child.Term } {
+const Capture = struct {
+    output: []u8,
+    stderr: []u8,
+    term: std.process.Child.Term,
+    truncated: bool = false,
+    timed_out: bool = false,
+
+    fn deinit(self: *Capture, gpa: std.mem.Allocator) void {
+        gpa.free(self.output);
+        gpa.free(self.stderr);
+    }
+};
+
+fn captureProcess(ctx: ToolContext, argv: []const []const u8, cwd: ?[]const u8, max_bytes: usize) !Capture {
     var child = try std.process.spawn(ctx.io, .{
         .argv = argv,
         .cwd = if (cwd) |c| .{ .path = c } else .inherit,
         .stdin = .ignore,
         .stdout = .pipe,
-        .stderr = .ignore,
+        .stderr = .pipe,
     });
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(ctx.gpa);
-    if (child.stdout) |file| {
-        var reader = file.reader(ctx.io, &.{});
-        const data = reader.interface.allocRemaining(ctx.gpa, .limited(max_bytes)) catch |err| {
+    var err_out = std.ArrayList(u8).empty;
+    errdefer err_out.deinit(ctx.gpa);
+    var stdout_done = false;
+    var stderr_done = false;
+    const start_ms = std.Io.Clock.awake.now(ctx.io).toMilliseconds();
+    const deadline_ms = start_ms + 120_000;
+    var truncated = false;
+    var timed_out = false;
+    var killed = false;
+    var stdout_file = child.stdout;
+    var stderr_file = child.stderr;
+    child.stdout = null;
+    child.stderr = null;
+    if (stdout_file) |f| _ = @import("../c.zig").sys.fcntl(f.handle, @import("../c.zig").sys.F_SETFL, @import("../c.zig").sys.O_NONBLOCK);
+    if (stderr_file) |f| _ = @import("../c.zig").sys.fcntl(f.handle, @import("../c.zig").sys.F_SETFL, @import("../c.zig").sys.O_NONBLOCK);
+    var buf: [8192]u8 = undefined;
+    while (!stdout_done or !stderr_done) {
+        if (!killed and std.Io.Clock.awake.now(ctx.io).toMilliseconds() > deadline_ms) {
             child.kill(ctx.io);
-            _ = child.wait(ctx.io) catch {};
-            if (err == error.StreamTooLong) {
-                out.appendSlice(ctx.gpa, "… [output truncated]\n") catch {};
-                return .{ .output = out.toOwnedSlice(ctx.gpa) catch &.{}, .term = .{ .exited = 124 } };
+            killed = true;
+            timed_out = true;
+            break;
+        }
+        var fds: [2]std.posix.pollfd = undefined;
+        var nfds: usize = 0;
+        if (!stdout_done and stdout_file != null) {
+            fds[nfds] = .{ .fd = stdout_file.?.handle, .events = std.posix.POLL.IN };
+            nfds += 1;
+        }
+        if (!stderr_done and stderr_file != null) {
+            fds[nfds] = .{ .fd = stderr_file.?.handle, .events = std.posix.POLL.IN };
+            nfds += 1;
+        }
+        if (nfds == 0) break;
+        _ = std.posix.poll(fds[0..nfds], 1000) catch continue;
+        if (!stdout_done and stdout_file != null) {
+            const n = std.posix.read(stdout_file.?.handle, &buf) catch |err| switch (err) {
+                error.WouldBlock => 0,
+                else => 0,
+            };
+            if (n == 0 and fds[0].revents != 0) {
+                stdout_file.?.close(ctx.io);
+                stdout_file = null;
+                stdout_done = true;
+            } else if (n > 0) {
+                if (out.items.len + n > max_bytes) {
+                    const take = max_bytes -| out.items.len;
+                    out.appendSlice(ctx.gpa, buf[0..take]) catch {};
+                    out.appendSlice(ctx.gpa, "\n… [output truncated]\n") catch {};
+                    truncated = true;
+                    child.kill(ctx.io);
+                    killed = true;
+                    break;
+                }
+                out.appendSlice(ctx.gpa, buf[0..n]) catch {};
             }
-            return err;
-        };
-        defer ctx.gpa.free(data);
-        try out.appendSlice(ctx.gpa, data);
+        }
+        if (!stderr_done and stderr_file != null) {
+            const idx: usize = if (fds.len > 1 and fds[1].fd == stderr_file.?.handle) 1 else 0;
+            const n = std.posix.read(stderr_file.?.handle, &buf) catch |err| switch (err) {
+                error.WouldBlock => 0,
+                else => 0,
+            };
+            if (n == 0 and fds[idx].revents != 0) {
+                stderr_file.?.close(ctx.io);
+                stderr_file = null;
+                stderr_done = true;
+            } else if (n > 0) {
+                if (err_out.items.len < 32 * 1024) {
+                    const take = @min(n, 32 * 1024 - err_out.items.len);
+                    err_out.appendSlice(ctx.gpa, buf[0..take]) catch {};
+                }
+            }
+        }
     }
-    const term = try child.wait(ctx.io);
-    return .{ .output = try out.toOwnedSlice(ctx.gpa), .term = term };
+    if (stdout_file) |f| f.close(ctx.io);
+    if (stderr_file) |f| f.close(ctx.io);
+    var term: std.process.Child.Term = .{ .exited = 0 };
+    if (!killed) {
+        term = child.wait(ctx.io) catch .{ .unknown = 0 };
+    }
+    return .{
+        .output = out.toOwnedSlice(ctx.gpa) catch &.{},
+        .stderr = err_out.toOwnedSlice(ctx.gpa) catch &.{},
+        .term = if (timed_out) .{ .exited = 124 } else term,
+        .truncated = truncated,
+        .timed_out = timed_out,
+    };
 }
-
 fn search(ctx: ToolContext, obj: std.json.ObjectMap) Result {
     const pattern = objString(obj, "pattern") orelse return resultError(ctx.gpa, "search", "missing pattern");
     const rel = objString(obj, "path") orelse ".";
@@ -309,12 +393,19 @@ fn search(ctx: ToolContext, obj: std.json.ObjectMap) Result {
     argv.append(ctx.gpa, "--") catch {};
     argv.append(ctx.gpa, pattern) catch {};
     argv.append(ctx.gpa, abs) catch {};
-    const cap = captureProcess(ctx, argv.items, ctx.workspace.root, 256 * 1024) catch |err| {
+    var cap = captureProcess(ctx, argv.items, ctx.workspace.root, 256 * 1024) catch |err| {
         return resultError(ctx.gpa, "search", @errorName(err));
     };
-    defer ctx.gpa.free(cap.output);
-    if (cap.term == .exited and cap.term.exited == 1) {
+    defer cap.deinit(ctx.gpa);
+    const code: u8 = switch (cap.term) {
+        .exited => |c| c,
+        else => 255,
+    };
+    if (code == 1 and cap.output.len == 0) {
         return resultOk(ctx.gpa, ctx.gpa.dupe(u8, "search: no matches") catch "", ctx.gpa.dupe(u8, "") catch &.{});
+    }
+    if (code != 0 and code != 1) {
+        return resultError(ctx.gpa, "search", std.mem.trim(u8, cap.stderr, " \t\r\n"));
     }
     var lines: usize = 0;
     var out = std.ArrayList(u8).empty;
@@ -343,59 +434,63 @@ fn shell(ctx: ToolContext, obj: std.json.ObjectMap) Result {
     const timeout_s = timeout_ms / 1000;
     const secs = std.fmt.allocPrint(ctx.gpa, "{d}s", .{@max(1, timeout_s)}) catch "30s";
     defer ctx.gpa.free(secs);
-    // Use coreutils timeout when available; stderr is merged into stdout by the
-    // shell invocation so output is captured without a second pipe deadlock.
-    const merged = std.fmt.allocPrint(ctx.gpa, "{s} 2>&1", .{command}) catch command;
-    defer if (merged.ptr != command.ptr) ctx.gpa.free(merged);
-    const argv = [_][]const u8{ "timeout", "--signal=TERM", secs, "/bin/sh", "-c", merged };
-    const cap = captureProcess(ctx, &argv, cwd_abs, 256 * 1024) catch |err| {
+    const argv = [_][]const u8{ "timeout", "--signal=TERM", "--kill-after=5s", secs, "/bin/sh", "-c", command };
+    var cap = captureProcess(ctx, &argv, cwd_abs, 256 * 1024) catch |err| {
         return resultError(ctx.gpa, "shell", @errorName(err));
     };
+    defer cap.deinit(ctx.gpa);
     const code: u8 = switch (cap.term) {
         .exited => |c| c,
         else => 255,
     };
-    const summary = std.fmt.allocPrint(ctx.gpa, "shell exit {d}", .{code}) catch ctx.gpa.dupe(u8, "shell") catch "";
-    var res = resultOk(ctx.gpa, summary, cap.output);
-    if (code != 0) res.is_error = true;
+    const summary = if (cap.truncated)
+        std.fmt.allocPrint(ctx.gpa, "shell exit {d} (output truncated)", .{code}) catch ctx.gpa.dupe(u8, "shell") catch ""
+    else
+        std.fmt.allocPrint(ctx.gpa, "shell exit {d}", .{code}) catch ctx.gpa.dupe(u8, "shell") catch "";
+    var combined = std.ArrayList(u8).empty;
+    errdefer combined.deinit(ctx.gpa);
+    combined.appendSlice(ctx.gpa, cap.output) catch {};
+    if (cap.stderr.len > 0 and code != 0) {
+        if (combined.items.len > 0) combined.appendSlice(ctx.gpa, "\n") catch {};
+        combined.appendSlice(ctx.gpa, "[stderr]\n") catch {};
+        combined.appendSlice(ctx.gpa, cap.stderr) catch {};
+    }
     if (code == 124) {
-        res.is_error = true;
         const msg = std.fmt.allocPrint(ctx.gpa, "\n[command timed out after {d}s]\n", .{timeout_s}) catch "";
         defer ctx.gpa.free(msg);
-        const old = res.content;
-        res.content = std.mem.concat(ctx.gpa, u8, &.{ old, msg }) catch old;
-        if (res.content.ptr != old.ptr) ctx.gpa.free(old);
+        combined.appendSlice(ctx.gpa, msg) catch {};
     }
+    var res = resultOk(ctx.gpa, summary, combined.toOwnedSlice(ctx.gpa) catch &.{});
+    if (code != 0) res.is_error = true;
     return res;
 }
 
-fn gitCommand(ctx: ToolContext, args: []const []const u8, summary_base: []const u8) Result {
+fn gitCommand(ctx: ToolContext, args: []const []const u8, summary_base: []const u8, max_bytes: usize) Result {
     var argv = std.ArrayList([]const u8).empty;
     defer argv.deinit(ctx.gpa);
     argv.appendSlice(ctx.gpa, &.{ "git", "--no-pager" }) catch {};
     argv.appendSlice(ctx.gpa, args) catch {};
-    const cap = captureProcess(ctx, argv.items, ctx.workspace.root, 256 * 1024) catch |err| {
+    var cap = captureProcess(ctx, argv.items, ctx.workspace.root, max_bytes) catch |err| {
         return resultError(ctx.gpa, summary_base, @errorName(err));
     };
+    defer cap.deinit(ctx.gpa);
     const code: u8 = switch (cap.term) {
         .exited => |c| c,
         else => 255,
     };
     if (code != 0) {
-        const msg = std.fmt.allocPrint(ctx.gpa, "{s} (exit {d})\n", .{ summary_base, code }) catch summary_base;
+        const msg = std.fmt.allocPrint(ctx.gpa, "{s} (exit {d})\n", .{ summary_base, code }) catch "";
         defer ctx.gpa.free(msg);
-        const old = cap.output;
-        const combined = std.mem.concat(ctx.gpa, u8, &.{ msg, old }) catch old;
-        if (combined.ptr != old.ptr) ctx.gpa.free(old);
+        const combined = std.mem.concat(ctx.gpa, u8, &.{ msg, cap.output, cap.stderr }) catch ctx.gpa.dupe(u8, "git failed") catch "";
         var res = resultOk(ctx.gpa, ctx.gpa.dupe(u8, summary_base) catch "", combined);
         res.is_error = true;
         return res;
     }
-    return resultOk(ctx.gpa, ctx.gpa.dupe(u8, summary_base) catch "", cap.output);
+    return resultOk(ctx.gpa, ctx.gpa.dupe(u8, summary_base) catch "", ctx.gpa.dupe(u8, cap.output) catch &.{});
 }
-
 fn gitDiff(ctx: ToolContext, obj: std.json.ObjectMap) Result {
     const staged = objBool(obj, "staged", false);
+    const diff_limit: usize = if (objInt(obj, "max_bytes")) |n| @intCast(@max(1024, @min(n, 1024 * 1024))) else 256 * 1024;
     var args = std.ArrayList([]const u8).empty;
     defer args.deinit(ctx.gpa);
     args.append(ctx.gpa, "diff") catch {};
@@ -406,14 +501,14 @@ fn gitDiff(ctx: ToolContext, obj: std.json.ObjectMap) Result {
         args.append(ctx.gpa, "--") catch {};
         args.append(ctx.gpa, ctx.workspace.relative(abs)) catch {};
     }
-    return gitCommand(ctx, args.items, "git diff");
+    return gitCommand(ctx, args.items, "git diff", diff_limit);
 }
 
 fn gitLog(ctx: ToolContext, obj: std.json.ObjectMap) Result {
     const count: usize = if (objInt(obj, "max_count")) |n| @intCast(@max(1, @min(n, 100))) else 20;
     const count_s = std.fmt.allocPrint(ctx.gpa, "-n{d}", .{count}) catch "-n20";
     defer ctx.gpa.free(count_s);
-    return gitCommand(ctx, &.{ "log", "--oneline", "--decorate", count_s }, "git log");
+    return gitCommand(ctx, &.{ "log", "--oneline", "--decorate", count_s }, "git log", 256 * 1024);
 }
 
 const max_file_bytes = 2 * 1024 * 1024;
@@ -427,8 +522,13 @@ fn writeAtomic(ctx: ToolContext, abs: []const u8, data: []const u8) !void {
         std.Io.Dir.cwd().access(ctx.io, abs, .{}) catch break :blk false;
         break :blk true;
     };
+    const existing_permissions: ?std.Io.File.Permissions = blk: {
+        if (!exists) break :blk null;
+        const st = std.Io.Dir.cwd().statFile(ctx.io, abs, .{}) catch break :blk null;
+        break :blk st.permissions;
+    };
     var dir = std.Io.Dir.cwd().createFileAtomic(ctx.io, abs, .{
-        .permissions = .default_file,
+        .permissions = existing_permissions orelse .default_file,
         .replace = exists,
         .make_path = false,
     }) catch |err| return err;
@@ -647,6 +747,7 @@ pub const Preview = struct {
     pub fn deinit(self: *Preview, gpa: std.mem.Allocator) void {
         if (self.summary.len > 0) gpa.free(self.summary);
         if (self.diff) |d| if (d.len > 0) gpa.free(d);
+        for (self.paths) |p| if (p.len > 0) gpa.free(p);
         if (self.paths.len > 0) gpa.free(self.paths);
         if (self.command) |c| gpa.free(c);
     }
@@ -667,15 +768,21 @@ pub fn preview(ctx: ToolContext, name: []const u8, args_json: []const u8) Previe
     };
     if (std.mem.eql(u8, name, "read_file")) {
         const path = objString(obj, "path") orelse return previewError(ctx.gpa, "read_file: missing path");
-        return .{ .summary = std.fmt.allocPrint(ctx.gpa, "Read {s}", .{path}) catch "" };
+        const summary = std.fmt.allocPrint(ctx.gpa, "Read {s}", .{path}) catch "";
+        if (ctx.workspace.resolveRead(path)) |abs| { defer ctx.gpa.free(abs); return .{ .summary = summary, .paths = makePathList(ctx.gpa, abs) }; } else |_| {}
+        return .{ .summary = summary };
     }
     if (std.mem.eql(u8, name, "list_files")) {
         const path = objString(obj, "path") orelse ".";
-        return .{ .summary = std.fmt.allocPrint(ctx.gpa, "List files in {s}", .{path}) catch "" };
+        const summary = std.fmt.allocPrint(ctx.gpa, "List files in {s}", .{path}) catch "";
+        if (ctx.workspace.resolveRead(path)) |abs| { defer ctx.gpa.free(abs); return .{ .summary = summary, .paths = makePathList(ctx.gpa, abs) }; } else |_| {}
+        return .{ .summary = summary };
     }
     if (std.mem.eql(u8, name, "search")) {
         const pattern = objString(obj, "pattern") orelse "";
-        return .{ .summary = std.fmt.allocPrint(ctx.gpa, "Search for {s}", .{pattern}) catch "" };
+        const summary = std.fmt.allocPrint(ctx.gpa, "Search for {s}", .{pattern}) catch "";
+        if (ctx.workspace.resolveRead(objString(obj, "path") orelse ".")) |abs| { defer ctx.gpa.free(abs); return .{ .summary = summary, .paths = makePathList(ctx.gpa, abs) }; } else |_| {}
+        return .{ .summary = summary };
     }
     if (std.mem.eql(u8, name, "shell")) {
         const command = objString(obj, "command") orelse return previewError(ctx.gpa, "shell: missing command");
@@ -688,8 +795,9 @@ pub fn preview(ctx: ToolContext, name: []const u8, args_json: []const u8) Previe
     if (std.mem.eql(u8, name, "write_file") or std.mem.eql(u8, name, "edit_file")) {
         const path = objString(obj, "path") orelse return previewError(ctx.gpa, "write: missing path");
         const abs = ctx.workspace.resolveWrite(path) catch |err| return previewError(ctx.gpa, @errorName(err));
-        const old = readExisting(ctx, abs) orelse "";
-        defer if (old.len > 0) ctx.gpa.free(old);
+        const old_opt = readExisting(ctx, abs);
+        defer if (old_opt) |o| ctx.gpa.free(o);
+        const old = old_opt orelse "";
         var new_content: []const u8 = "";
         var owned_new: ?[]u8 = null;
         defer if (owned_new) |n| ctx.gpa.free(n);
@@ -705,10 +813,37 @@ pub fn preview(ctx: ToolContext, name: []const u8, args_json: []const u8) Previe
         }
         const diff = makeDiff(ctx.gpa, old, new_content, ctx.workspace.relative(abs)) catch null;
         const summary = std.fmt.allocPrint(ctx.gpa, "{s} {s}", .{ if (std.mem.eql(u8, name, "write_file")) "Write" else "Edit", ctx.workspace.relative(abs) }) catch "";
-        var paths: [][]const u8 = ctx.gpa.alloc([]const u8, 1) catch &.{};
-        if (paths.len > 0) paths[0] = ctx.gpa.dupe(u8, abs) catch abs;
+        const paths = makePathList(ctx.gpa, abs);
         ctx.gpa.free(abs);
         return .{ .summary = summary, .diff = diff, .paths = paths };
     }
     return .{ .summary = std.fmt.allocPrint(ctx.gpa, "Run {s}", .{name}) catch "" };
+}
+
+fn makePathList(gpa: std.mem.Allocator, abs: []const u8) []const []const u8 {
+    const list = gpa.alloc([]const u8, 1) catch return &.{};
+    const copy = gpa.dupe(u8, abs) catch {
+        gpa.free(list);
+        return &.{};
+    };
+    list[0] = copy;
+    return list;
+}
+
+test "shell output truncation does not crash" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &path_buf);
+    const ws = try workspace_mod.Workspace.init(gpa, io, path_buf[0..root_len]);
+    defer {
+        var w = ws;
+        w.deinit();
+    }
+    const ctx = ToolContext{ .gpa = gpa, .io = io, .workspace = &ws };
+    var r = execute(ctx, "shell", "{\"command\":\"head -c 400000 /dev/zero\",\"timeout_ms\":5000}");
+    defer r.deinit(gpa);
+    try std.testing.expect(r.is_error or std.mem.indexOf(u8, r.content, "truncated") != null);
 }

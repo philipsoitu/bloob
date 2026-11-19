@@ -181,8 +181,9 @@ pub const Runtime = struct {
     }
 
     fn setError(self: *Runtime, msg: []const u8) void {
+        const owned = self.gpa.dupe(u8, msg) catch return;
         if (self.last_error) |e| self.gpa.free(e);
-        self.last_error = self.gpa.dupe(u8, msg) catch null;
+        self.last_error = owned;
     }
 
     pub fn lastError(self: *Runtime) []const u8 {
@@ -243,6 +244,20 @@ pub const Runtime = struct {
         defer self.gpa.free(path_z);
         const top = util.top(L);
         defer util.setTop(L, top);
+        // Extend package.path before executing the config so modules in the
+        // bloob config directory can be required by init.lua.
+        const dir = dirName(path);
+        const extra = try std.fmt.allocPrint(self.gpa, "{s}/lua/?.lua;{s}/lua/?/init.lua;{s}/?.lua;{s}/?/init.lua;", .{ dir, dir, dir, dir });
+        defer self.gpa.free(extra);
+        util.getGlobal(L, "package");
+        util.field(L, -1, "path");
+        if (util.getString(L, -1)) |old| {
+            const combined = try std.mem.concat(self.gpa, u8, &.{ extra, old });
+            defer self.gpa.free(combined);
+            util.pushString(L, combined);
+            lua.lua_setfield(L, -3, "path");
+        }
+        util.pop(L, 2);
         var err = std.ArrayList(u8).empty;
         defer err.deinit(self.gpa);
         const rc = lua.luaL_loadbuffer(L, code.ptr, code.len, path_z.ptr);
@@ -260,21 +275,6 @@ pub const Runtime = struct {
             return error.ConfigRuntime;
         };
         try self.addConfigSource(path);
-        // Prepare a private module search path scoped to the user's bloob directory.
-        const dir = dirName(path);
-        const extra = try std.fmt.allocPrint(self.gpa, "{s}/lua/?.lua;{s}/lua/?/init.lua;{s}/?.lua;{s}/?/init.lua;", .{ dir, dir, dir, dir });
-        defer self.gpa.free(extra);
-        const extra_z = try util.dupeZ(self.gpa, extra);
-        defer self.gpa.free(extra_z);
-        util.getGlobal(L, "package");
-        util.field(L, -1, "path");
-        if (util.getString(L, -1)) |old| {
-            const combined = try std.mem.concat(self.gpa, u8, &.{ extra, old });
-            defer self.gpa.free(combined);
-            util.pushString(L, combined);
-            lua.lua_setfield(L, -3, "path");
-        }
-        util.pop(L, 2);
     }
 
     pub fn addConfigSource(self: *Runtime, path: []const u8) !void {
@@ -586,7 +586,7 @@ pub const Runtime = struct {
             return .pass;
         };
         defer parsed.deinit();
-        pushJsonValue(L, parsed.value) catch {
+        pushJsonValue(L, parsed.value, 0) catch {
             util.newTable(L);
         };
         util.pcall(L, 2, 1, null, self.gpa) catch return .pass;
@@ -638,7 +638,7 @@ pub const Runtime = struct {
             return luaToJson(self.gpa, L, -1);
         };
         defer parsed.deinit();
-        pushJsonValue(L, parsed.value) catch {
+        pushJsonValue(L, parsed.value, 0) catch {
             util.newTable(L);
         };
         var errbuf = std.ArrayList(u8).empty;
@@ -974,11 +974,7 @@ pub const Runtime = struct {
                     const color = style.Color.parse(c);
                     const rgb = switch (color) {
                         .rgb => |v| v,
-                        .xterm => |n| blk: {
-                            const tmp = style.Palette.empty();
-                            _ = tmp;
-                            break :blk rgbFromXterm(n);
-                        },
+                        .xterm => |n| style.xtermToRgb(n),
                         .semantic => |s2| p.get(s2),
                         .default => null,
                     };
@@ -988,20 +984,6 @@ pub const Runtime = struct {
             }
         }
         return p;
-    }
-
-    fn rgbFromXterm(n: u8) style.Rgb {
-        return switch (n) {
-            0 => .{ .r = 0, .g = 0, .b = 0 },
-            1 => .{ .r = 128, .g = 0, .b = 0 },
-            2 => .{ .r = 0, .g = 128, .b = 0 },
-            3 => .{ .r = 128, .g = 128, .b = 0 },
-            4 => .{ .r = 0, .g = 0, .b = 128 },
-            5 => .{ .r = 128, .g = 0, .b = 128 },
-            6 => .{ .r = 0, .g = 128, .b = 128 },
-            7 => .{ .r = 192, .g = 192, .b = 192 },
-            else => .{ .r = 128, .g = 128, .b = 128 },
-        };
     }
 
     fn c_ui_theme_register(L: ?*lua.lua_State) callconv(.c) c_int {
@@ -1207,7 +1189,8 @@ pub const Runtime = struct {
     }
 };
 
-fn pushJsonValue(L: util.State, value: std.json.Value) !void {
+fn pushJsonValue(L: util.State, value: std.json.Value, depth: usize) !void {
+    if (depth > 32) return error.TooDeep;
     switch (value) {
         .null => lua.lua_pushnil(L),
         .bool => |b| lua.lua_pushboolean(L, if (b) 1 else 0),
@@ -1218,7 +1201,7 @@ fn pushJsonValue(L: util.State, value: std.json.Value) !void {
         .array => |arr| {
             util.newTable(L);
             for (arr.items, 0..) |v, i| {
-                try pushJsonValue(L, v);
+                try pushJsonValue(L, v, depth + 1);
                 util.rawSet(L, -2, @intCast(i + 1));
             }
         },
@@ -1227,7 +1210,7 @@ fn pushJsonValue(L: util.State, value: std.json.Value) !void {
             var it = obj.iterator();
             while (it.next()) |entry| {
                 util.pushString(L, entry.key_ptr.*);
-                try pushJsonValue(L, entry.value_ptr.*);
+                try pushJsonValue(L, entry.value_ptr.*, depth + 1);
                 lua.lua_settable(L, -3);
             }
         },
@@ -1236,8 +1219,7 @@ fn pushJsonValue(L: util.State, value: std.json.Value) !void {
 
 fn luaToJson(gpa: std.mem.Allocator, L: util.State, idx: c_int) ?[]u8 {
     var out = std.ArrayList(u8).empty;
-    serializeLua(gpa, L, idx, &out, 0) catch |err| {
-        std.debug.print("serialize error: {s} top={d}\n", .{ @errorName(err), util.top(L) });
+    serializeLua(gpa, L, idx, &out, 0) catch {
         out.deinit(gpa);
         return null;
     };
@@ -1285,8 +1267,20 @@ fn serializeLua(gpa: std.mem.Allocator, L: util.State, idx: c_int, out: *std.Arr
                     if (lua.lua_next(L, abs) == 0) break;
                     if (!first) try out.append(gpa, ',');
                     first = false;
-                    if (util.getString(L, -2)) |key| {
+                    const key_type = lua.lua_type(L, -2);
+                    if (key_type == lua.LUA_TSTRING) {
+                        const key = util.getString(L, -2) orelse "";
                         try appendJsonString(gpa, out, key);
+                    } else if (key_type == lua.LUA_TNUMBER) {
+                        if (util.getInt(L, -2)) |ival| {
+                            const tmp = try std.fmt.allocPrint(gpa, "{d}", .{ival});
+                            defer gpa.free(tmp);
+                            try appendJsonString(gpa, out, tmp);
+                        } else if (util.getNumber(L, -2)) |fval| {
+                            const tmp = try std.fmt.allocPrint(gpa, "{d}", .{fval});
+                            defer gpa.free(tmp);
+                            try appendJsonString(gpa, out, tmp);
+                        }
                     } else {
                         try out.appendSlice(gpa, "\"key\"");
                     }

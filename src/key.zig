@@ -91,6 +91,10 @@ pub const Parser = struct {
 
     pub fn feed(self: *Parser, bytes: []const u8, ctx: anytype, comptime handler: fn (@TypeOf(ctx), Event) anyerror!void) !void {
         try self.buf.appendSlice(self.gpa, bytes);
+        if (!self.in_paste and self.buf.items.len > 64 * 1024) {
+            self.buf.clearRetainingCapacity();
+            return;
+        }
         while (self.buf.items.len > 0) {
             if (self.in_paste) {
                 const end_marker = "\x1b[201~";
@@ -219,20 +223,18 @@ pub const Parser = struct {
             if (c < '0' or c > '9') continue;
             const digit: u32 = c - '0';
             if (part == 0) {
-                number = number * 10 + digit;
+                number = number *| 10 +| digit;
                 have_number = true;
             } else if (part == 1) {
-                second = second * 10 + digit;
+                second = second *| 10 +| digit;
                 have_second = true;
             }
         }
-        if (have_second) {
+        if (have_second and second >= 1) {
             const m = second - 1;
-            if (have_second and second >= 1) {
-                if (m & 1 != 0) mods.shift = true;
-                if (m & 2 != 0) mods.alt = true;
-                if (m & 4 != 0) mods.ctrl = true;
-            }
+            if (m & 1 != 0) mods.shift = true;
+            if (m & 2 != 0) mods.alt = true;
+            if (m & 4 != 0) mods.ctrl = true;
         }
         const code: ?Code = switch (final) {
             'A' => .up,
@@ -308,7 +310,7 @@ pub const Parser = struct {
         while (i < bytes.len and idx < 3) : (i += 1) {
             const c = bytes[i];
             if (c >= '0' and c <= '9') {
-                values[idx] = values[idx] * 10 + (c - '0');
+                values[idx] = values[idx] *| 10 +| (c - '0');
                 continue;
             }
             if (c == ';') {
@@ -413,11 +415,8 @@ pub fn parseSpec(spec: []const u8, leader: u21) ?Key {
         return keyFromCodepoint(d.cp);
     }
     if (std.mem.startsWith(u8, spec, "<leader>")) {
-        const lead_rest = spec["<leader>".len..];
-        if (lead_rest.len != 1) return null;
-        const ld = text.decode(lead_rest, 0);
-        if (ld.len != 1) return null;
-        return keyFromCodepoint(leader);
+        _ = leader;
+        return null;
     }
     if (spec[0] == '<') {
         if (std.mem.indexOfScalar(u8, spec, '>')) |close| {
@@ -473,5 +472,5 @@ test "key specs" {
     const k = parseSpec("<C-p>", ' ').?;
     try std.testing.expect(k.mods.ctrl);
     try std.testing.expectEqual(@as(u21, 'p'), k.char);
-    try std.testing.expect(parseSpec("<leader>a", '\\') != null);
+    try std.testing.expect(parseSpec("<leader>a", '\\') == null);
 }

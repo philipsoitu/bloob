@@ -171,7 +171,7 @@ pub fn detectColorMode() ColorMode {
     return .ansi16;
 }
 
-fn xtermToRgb(n: u8) Rgb {
+pub fn xtermToRgb(n: u8) Rgb {
     if (n < 16) return ansi16ToRgb(n);
     if (n >= 232) {
         const v: u8 = @intCast(8 + @as(u16, n - 232) * 10);

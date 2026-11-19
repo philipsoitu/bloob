@@ -194,7 +194,6 @@ pub const App = struct {
         self.cwd = try gpa.dupe(u8, opts.cwd orelse ".");
         self.session_id = try gpa.dupe(u8, "local");
         self.workspace = workspace_mod.Workspace.init(gpa, io, self.cwd) catch null;
-        if (self.workspace) |*w| self.permission_engine.workspace = w;
         self.mock_mode = std.mem.startsWith(u8, self.provider, "mock") or std.mem.startsWith(u8, self.provider, "fixture");
         return self;
     }
@@ -262,6 +261,7 @@ pub const App = struct {
         if (self.session) |*old| old.deinit();
         self.session = loaded;
         self.notify("Session resumed", false);
+        self.emitSessionEvent("session.loaded");
         self.dirty = true;
     }
 
@@ -285,6 +285,7 @@ pub const App = struct {
         if (self.session) |*old| old.deinit();
         self.setSessionId(new_session.id);
         self.session = new_session;
+        self.emitSessionEvent("session.created");
         self.persisted_count = 0;
         self.dirty = true;
     }
@@ -373,6 +374,7 @@ pub const App = struct {
             if (srcs.items.len > 0) self.notify("Loaded config", false);
         }
         self.dirty = true;
+        if (self.lua) |l| _ = l.emit("config.loaded", "{}");
     }
 
     fn host(self: *App) lua_runtime.Host {
@@ -392,12 +394,16 @@ pub const App = struct {
 
     pub fn setModel(self: *App, model: []const u8) void {
         const owned = self.gpa.dupe(u8, model) catch return;
+        const slash = std.mem.indexOfScalar(u8, owned, '/');
+        const provider_name = if (slash) |idx| owned[0..idx] else "mock";
+        const provider_owned = self.gpa.dupe(u8, provider_name) catch {
+            self.gpa.free(owned);
+            return;
+        };
         if (self.model.len > 0) self.gpa.free(self.model);
-        self.model = owned;
-        const slash = std.mem.indexOfScalar(u8, self.model, '/');
         if (self.provider.len > 0) self.gpa.free(self.provider);
-        const provider_name = if (slash) |idx| self.model[0..idx] else "mock";
-        self.provider = self.gpa.dupe(u8, provider_name) catch (self.gpa.dupe(u8, "mock") catch return);
+        self.model = owned;
+        self.provider = provider_owned;
         self.mock_mode = std.mem.startsWith(u8, self.provider, "mock") or std.mem.startsWith(u8, self.provider, "fixture");
         self.dirty = true;
     }
@@ -453,6 +459,7 @@ pub const App = struct {
             self.lua_config_error = null;
         }
         self.notify("Configuration reloaded", false);
+        if (self.lua) |l| _ = l.emit("config.loaded", "{}");
         self.dirty = true;
     }
 
@@ -520,8 +527,9 @@ pub const App = struct {
     }
 
     pub fn notify(self: *App, msg: []const u8, is_error: bool) void {
+        const copy = self.gpa.dupe(u8, msg) catch return;
         if (self.notice.len > 0) self.gpa.free(self.notice);
-        self.notice = self.gpa.dupe(u8, msg) catch &.{};
+        self.notice = copy;
         self.notice_is_error = is_error;
         self.notice_until_ms = self.nowMs() + 6000;
         self.dirty = true;
@@ -530,12 +538,15 @@ pub const App = struct {
     pub fn run(self: *App) !void {
         if (self.workspace) |*w| self.permission_engine.workspace = w;
         if (self.conversation.messages.items.len == 0) {
-            const m = try self.conversation.add(.system, "bloob is ready. Model: " ++ "mock/fixture", self.nowMs());
+            const ready = std.fmt.allocPrint(self.gpa, "bloob is ready. Model: {s}", .{self.model}) catch "bloob is ready";
+            defer self.gpa.free(ready);
+            const m = try self.conversation.add(.system, ready, self.nowMs());
             m.usage = .{};
-            if (self.model.len > 0) {
-                try m.setModel(self.gpa, self.model);
+            if (self.model.len > 0) try m.setModel(self.gpa, self.model);
+            if (self.mock_mode) {
+                const welcome = "Welcome to **bloob**, a Lua-programmable coding agent.\n\nType a message and press Enter. Try `/help`.\n\nThe deterministic `mock/fixture` provider is active, so no API key is required.\n\n```zig\nconst bloob = @import(\"bloob\");\n```\n";
+                _ = try self.conversation.add(.assistant, welcome, self.nowMs());
             }
-            _ = try self.conversation.add(.assistant, "Welcome to **bloob**, a Lua-programmable coding agent.\n\nType a message and press Enter. Try `/help`.\n\nThe deterministic `mock/fixture` provider is active, so no API key is required.\n\n```zig\nconst bloob = @import(\"bloob\");\n```\n", self.nowMs());
         }
         self.persistPendingMessages();
         self.size = self.terminal.size();
@@ -604,6 +615,10 @@ pub const App = struct {
     fn tick(self: *App, now: i64) void {
         if (self.agent_phase == .streaming) {
             self.spinner +%= 1;
+            if (self.provider_stream != null) {
+                self.dirty = true;
+                return;
+            }
             if (now - self.last_stream_ms >= 18) {
                 self.last_stream_ms = now;
                 if (self.stream_pos < self.stream_text.len) {
@@ -1047,6 +1062,14 @@ pub const App = struct {
             try self.runSlash(value);
             return;
         }
+        self.tool_iterations = 0;
+        self.applyModelRouting();
+        if (self.lua) |l| {
+            const p = self.jsonInnerDup(value) catch "";
+            defer if (p.len > 0) self.gpa.free(p);
+            const payload = std.fmt.allocPrint(self.gpa, "{{\"prompt\":\"{s}\"}}", .{p}) catch null;
+            if (payload) |pl| { defer self.gpa.free(pl); _ = l.emit("agent.before_turn", pl); }
+        }
         _ = try self.conversation.add(.user, value, self.nowMs());
         self.persistPendingMessages();
         self.chat_scroll = 0;
@@ -1130,6 +1153,10 @@ pub const App = struct {
             return;
         }
         for (last.tool_calls.items) |tc| {
+            if (self.pending_tools.items.len >= 32) {
+                self.notify("Tool call limit reached for this turn", true);
+                break;
+            }
             self.pending_tools.append(self.gpa, .{
                 .id = self.gpa.dupe(u8, tc.id) catch continue,
                 .name = self.gpa.dupe(u8, tc.name) catch continue,
@@ -1178,7 +1205,9 @@ pub const App = struct {
             defer if (tool_esc.len > 0) self.gpa.free(tool_esc);
             const args_esc = self.jsonInnerDup(call.args) catch "";
             defer if (args_esc.len > 0) self.gpa.free(args_esc);
-            const payload = std.fmt.allocPrint(self.gpa, "{{\"tool\":\"{s}\",\"arguments\":\"{s}\",\"summary\":\"{s}\"}}", .{ tool_esc, args_esc, self.jsonInnerDup(prev.summary) catch "" }) catch null;
+            const summary_esc = self.jsonInnerDup(prev.summary) catch "";
+            defer if (summary_esc.len > 0) self.gpa.free(summary_esc);
+            const payload = std.fmt.allocPrint(self.gpa, "{{\"tool\":\"{s}\",\"arguments\":\"{s}\",\"summary\":\"{s}\"}}", .{ tool_esc, args_esc, summary_esc }) catch null;
             if (payload) |p| {
                 defer self.gpa.free(p);
                 switch (l.emit("tool.before_execute", p)) {
@@ -1238,6 +1267,7 @@ pub const App = struct {
             const owned = content.ptr != res.content.ptr;
             defer if (owned) self.gpa.free(content);
             self.setLastToolSummary(res.summary);
+            self.emitToolAfter(call.name, res.is_error, res.summary);
             self.appendToolMessage(call, content, res.is_error);
         } else if (self.lua) |l| {
             if (l.toolByName(call.name)) |lt| {
@@ -1245,6 +1275,7 @@ pub const App = struct {
                 if (out) |json| {
                     defer self.gpa.free(json);
                     self.appendToolMessage(call, json, false);
+                    self.emitToolAfter(call.name, false, "custom Lua tool completed");
                 } else {
                     self.appendToolMessage(call, "Lua tool failed", true);
                 }
@@ -1289,7 +1320,6 @@ pub const App = struct {
     }
 
     fn continueAfterTools(self: *App) void {
-        self.tool_iterations = 0;
         if (self.mock_mode) {
             const summary = if (self.last_tool_summary.len > 0) self.last_tool_summary else "Tool execution completed.";
             const msg = std.fmt.allocPrint(self.gpa, "Fixture tool loop complete. {s}\n\nThe result is shown above. No model was contacted; this is the deterministic offline fixture.", .{summary}) catch "Fixture tool loop complete.";
@@ -1343,6 +1373,7 @@ pub const App = struct {
 
     fn startProviderRequest(self: *App) !void {
         if (self.mock_mode) return;
+        self.applyModelRouting();
         var resolved = provider_registry.resolve(self.gpa, self.model) catch |err| {
             const message = std.fmt.allocPrint(self.gpa, "[provider error] {s}", .{self.providerErrorMessage(err)}) catch "[provider error]";
             defer self.gpa.free(message);
@@ -1447,8 +1478,20 @@ pub const App = struct {
                     if (tc.name.items.len == 0) continue;
                     const call_id = if (tc.id.items.len > 0) tc.id.items else std.fmt.allocPrint(self.gpa, "call_{d}", .{self.conversation.next_id}) catch "call_0";
                     defer if (tc.id.items.len == 0) self.gpa.free(call_id);
-                    const args = if (tc.args.items.len > 0) tc.args.items else "{}";
-                    msg.addToolCall(self.gpa, call_id, tc.name.items, args) catch {};
+                    const raw_args = if (tc.args.items.len > 0) tc.args.items else "{}";
+                    var args_valid = true;
+                    if (std.json.parseFromSlice(std.json.Value, self.gpa, raw_args, .{})) |parsed| {
+                        var p = parsed;
+                        p.deinit();
+                    } else |_| {
+                        args_valid = false;
+                    }
+                    if (!args_valid) {
+                        msg.text.appendSlice(self.gpa, "\n\n_[discarded a truncated tool call with invalid JSON arguments]_") catch {};
+                        self.notify("Discarded a tool call with invalid JSON arguments", true);
+                        continue;
+                    }
+                    msg.addToolCall(self.gpa, call_id, tc.name.items, raw_args) catch {};
                     had_tools = true;
                 }
             }
@@ -1645,6 +1688,15 @@ pub const App = struct {
                 if (count == 0) self.notify("No saved sessions", false) else self.notify("Saved sessions available; use --list-sessions for details", false);
             } else if (std.mem.eql(u8, args, "new")) {
                 self.newConversation();
+            } else if (std.mem.startsWith(u8, args, "delete ")) {
+                const id = std.mem.trim(u8, args["delete ".len..], " ");
+                if (self.session_store) |*s| {
+                    s.delete(id) catch {
+                        self.notify("Cannot delete session", true);
+                        return;
+                    };
+                    self.notify("Session deleted", false);
+                }
             } else if (std.mem.startsWith(u8, args, "resume ")) {
                 const id = std.mem.trim(u8, args["resume ".len..], " ");
                 if (self.session_store) |*s| {
@@ -1699,7 +1751,24 @@ pub const App = struct {
         self.dirty = true;
     }
 
+    fn cancelCurrentWork(self: *App) void {
+        if (self.provider_stream != null) {
+            _ = self.cancelProvider();
+        } else if (self.agent_phase == .streaming) {
+            self.finishStreaming(true);
+        }
+        if (self.approval) |*a| {
+            a.deinit(self.gpa);
+            self.approval = null;
+        }
+        for (self.pending_tools.items) |*p| p.deinit(self.gpa);
+        self.pending_tools.clearRetainingCapacity();
+        self.tool_index = 0;
+        self.tool_iterations = 0;
+    }
+
     fn newConversation(self: *App) void {
+        self.cancelCurrentWork();
         self.conversation.clear();
         self.createNewSession();
         _ = self.conversation.add(.system, "New conversation", self.nowMs()) catch return;
@@ -1818,6 +1887,11 @@ pub const App = struct {
         if (self.frame) |*f| f.deinit();
         self.frame = try Frame.init(self.gpa, @max(1, self.size.cols), @max(1, self.size.rows));
         self.dirty = true;
+        if (self.lua) |l| {
+            var buf: [96]u8 = undefined;
+            const payload = std.fmt.bufPrint(&buf, "{{\"width\":{d},\"height\":{d}}}", .{ self.size.cols, self.size.rows }) catch "{}";
+            _ = l.emit("ui.resize", payload);
+        }
     }
 
     fn render(self: *App) !void {
@@ -1835,6 +1909,7 @@ pub const App = struct {
 
         var layout: *ui.Node = undefined;
         if (self.lua) |l| {
+            self.lua_layout_failed = false;
             layout = l.buildLayout(a, self.snapshot()) catch blk: {
                 if (!self.lua_layout_failed) {
                     self.lua_layout_failed = true;
@@ -1843,7 +1918,6 @@ pub const App = struct {
                 }
                 break :blk try self.buildNativeLayout(a);
             };
-            if (!self.lua_layout_failed) {}
         } else {
             layout = try self.buildNativeLayout(a);
         }
@@ -2247,6 +2321,40 @@ pub const App = struct {
         }
         _ = a;
     }
+    fn applyModelRouting(self: *App) void {
+        const l = self.lua orelse return;
+        const routed = l.routeModel("chat", self.model) orelse return;
+        defer self.gpa.free(routed);
+        if (routed.len > 0 and !std.mem.eql(u8, routed, self.model)) {
+            self.setModel(routed);
+            self.notify("Model routed by Lua policy", false);
+        }
+    }
+
+    fn emitSessionEvent(self: *App, name: []const u8) void {
+        const l = self.lua orelse return;
+        const id_esc = self.jsonInnerDup(self.session_id) catch return;
+        defer self.gpa.free(id_esc);
+        const payload = std.fmt.allocPrint(self.gpa, "{{\"session_id\":\"{s}\"}}", .{id_esc}) catch return;
+        defer self.gpa.free(payload);
+        _ = l.emit(name, payload);
+    }
+
+    fn emitEventJson(self: *App, name: []const u8, payload: []const u8) void {
+        if (self.lua) |l| _ = l.emit(name, payload);
+    }
+
+    fn emitToolAfter(self: *App, name: []const u8, is_error: bool, summary: []const u8) void {
+        const l = self.lua orelse return;
+        const tool_esc = self.jsonInnerDup(name) catch return;
+        defer self.gpa.free(tool_esc);
+        const sum_esc = self.jsonInnerDup(summary) catch return;
+        defer self.gpa.free(sum_esc);
+        const payload = std.fmt.allocPrint(self.gpa, "{{\"tool\":\"{s}\",\"ok\":{s},\"summary\":\"{s}\"}}", .{ tool_esc, if (is_error) "false" else "true", sum_esc }) catch return;
+        defer self.gpa.free(payload);
+        _ = l.emit("tool.after_execute", payload);
+        if (is_error) _ = l.emit("tool.error", payload);
+    }
 };
 
 fn truncatePath(path: []const u8, width: u16) []const u8 {
@@ -2300,9 +2408,16 @@ fn hostSetModel(ctx: *anyopaque, model: []const u8) void {
 fn hostSetTheme(ctx: *anyopaque, name: []const u8) void {
     const self: *App = @ptrCast(@alignCast(ctx));
     if (self.themes.set(name)) {
+        const copy = self.gpa.dupe(u8, name) catch return;
         if (self.theme_name.len > 0) self.gpa.free(self.theme_name);
-        self.theme_name = self.gpa.dupe(u8, name) catch &.{};
+        self.theme_name = copy;
         self.dirty = true;
+        if (self.lua) |l| {
+            const n = self.jsonInnerDup(name) catch "";
+            defer if (n.len > 0) self.gpa.free(n);
+            const payload = std.fmt.allocPrint(self.gpa, "{{\"theme\":\"{s}\"}}", .{n}) catch null;
+            if (payload) |p| { defer self.gpa.free(p); _ = l.emit("theme.changed", p); }
+        }
     }
 }
 fn hostRegisterTheme(ctx: *anyopaque, name: []const u8, palette: *const style.Palette) void {

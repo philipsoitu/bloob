@@ -222,3 +222,75 @@ test "lua custom tool registration and ctx read_file" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"path\":\"src/main.zig\"") != null);
     try std.testing.expect(rt.tools.items.len == 1);
 }
+
+test "event payload fields and decisions" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var host = TestHost{};
+    defer host.notified.deinit(std.testing.allocator);
+    defer host.model.deinit(std.testing.allocator);
+    defer host.theme.deinit(std.testing.allocator);
+    const rt = try runtime_mod.Runtime.init(std.testing.allocator, io, host.host());
+    defer rt.deinit();
+    try rt.execString(
+        \\local events = require("bloob.events")
+        \\events.on("probe.event", function(e)
+        \\  if e.tool == "shell" then return "deny" end
+        \\  if e.tool == "write_file" then return "ask" end
+        \\  return nil
+        \\end)
+    , "=events");
+    try std.testing.expectEqual(runtime_mod.Runtime.EventDecision.deny, rt.emit("probe.event", "{\"tool\":\"shell\"}"));
+    try std.testing.expectEqual(runtime_mod.Runtime.EventDecision.ask, rt.emit("probe.event", "{\"tool\":\"write_file\"}"));
+    try std.testing.expectEqual(runtime_mod.Runtime.EventDecision.pass, rt.emit("probe.event", "{\"tool\":\"read_file\"}"));
+}
+
+test "serialize custom tool result with numeric keys" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var host = TestHost{};
+    defer host.notified.deinit(std.testing.allocator);
+    defer host.model.deinit(std.testing.allocator);
+    defer host.theme.deinit(std.testing.allocator);
+    const rt = try runtime_mod.Runtime.init(std.testing.allocator, io, host.host());
+    defer rt.deinit();
+    try rt.execString(
+        \\local tools = require("bloob.tools")
+        \\tools.register("numeric", {
+        \\  description = "numeric result",
+        \\  schema = { type = "object" },
+        \\  run = function(ctx, args) return { [2] = "a", [4] = "b" } end,
+        \\})
+    , "=tool");
+    const tool = rt.toolByName("numeric") orelse return error.MissingTool;
+    const out = rt.invokeTool(tool, "{}") orelse return error.ToolFailed;
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"2\":\"a\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"4\":\"b\"") != null);
+}
+
+test "lua keymap callback invocation" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var host = TestHost{};
+    defer host.notified.deinit(std.testing.allocator);
+    defer host.model.deinit(std.testing.allocator);
+    defer host.theme.deinit(std.testing.allocator);
+    const rt = try runtime_mod.Runtime.init(std.testing.allocator, io, host.host());
+    defer rt.deinit();
+    try rt.execString(
+        \\local keymap = require("bloob.keymap")
+        \\local ui = require("bloob.ui")
+        \\keymap.set("normal", "<C-k>", function() ui.notify("callback fired") end)
+    , "=keymap");
+    const key = @import("../key.zig").parseSpec("<C-k>", '\\').?;
+    const found = rt.findKey("normal", key) orelse return error.NotFound;
+    switch (found.action) {
+        .callback => |cb| try std.testing.expect(rt.invokeCallback(cb.ref)),
+        .command => return error.WrongAction,
+    }
+    try std.testing.expectEqualStrings("callback fired", host.notified.items);
+}

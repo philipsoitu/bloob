@@ -36,7 +36,7 @@ pub const Workspace = struct {
         return self.root;
     }
 
-    fn isWithin(root: []const u8, path: []const u8) bool {
+    pub fn isWithin(root: []const u8, path: []const u8) bool {
         if (std.mem.eql(u8, root, path)) return true;
         if (!std.mem.startsWith(u8, path, root)) return false;
         if (path.len <= root.len) return false;
@@ -80,6 +80,7 @@ pub const Workspace = struct {
         };
         defer self.gpa.free(resolved_z);
         if (!isWithin(self.root, resolved_z)) return error.SymlinkEscape;
+        if (isSensitivePath(resolved_z)) return error.SensitivePath;
         return try self.gpa.dupe(u8, resolved_z);
     }
 
@@ -93,6 +94,16 @@ pub const Workspace = struct {
             try std.fs.path.resolve(self.gpa, &.{ self.root, user_path });
         defer self.gpa.free(joined);
         if (isSensitivePath(joined)) return error.SensitivePath;
+        // If the target already exists, canonicalize it so symlinks cannot smuggle
+        // a sensitive/outside path past the parent-only check.
+        if (std.Io.Dir.cwd().access(self.io, joined, .{})) |_| {
+            const existing_z = std.Io.Dir.cwd().realPathFileAlloc(self.io, joined, self.gpa) catch |err| return err;
+            defer self.gpa.free(existing_z);
+            if (isSensitivePath(existing_z)) return error.SensitivePath;
+            if (!isWithin(self.root, existing_z)) return error.SymlinkEscape;
+            if (std.mem.indexOf(u8, joined, "/.git/") != null) return error.SensitivePath;
+            return try self.gpa.dupe(u8, existing_z);
+        } else |_| {}
         const parent = std.fs.path.dirname(joined) orelse return error.InvalidPath;
         const base = std.fs.path.basename(joined);
         if (std.mem.eql(u8, base, "..") or std.mem.eql(u8, base, ".")) return error.InvalidPath;
@@ -128,4 +139,18 @@ test "sensitive paths" {
     try std.testing.expect(Workspace.isSensitivePath("/home/u/project/.env"));
     try std.testing.expect(Workspace.isSensitivePath("/home/u/.ssh/id_ed25519"));
     try std.testing.expect(!Workspace.isSensitivePath("/home/u/project/src/main.zig"));
+}
+
+test "symlink to sensitive file is denied" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = ".env", .data = "SECRET_TOKEN=abc\n" });
+    tmp.dir.symLink(io, ".env", "notes.txt", .{}) catch return error.SkipZigTest;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &path_buf);
+    var ws = try Workspace.init(gpa, io, path_buf[0..root_len]);
+    defer ws.deinit();
+    try std.testing.expectError(error.SensitivePath, ws.resolveRead("notes.txt"));
 }
