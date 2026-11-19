@@ -1,0 +1,10 @@
+# Documented expected failures for the bloob PTY smoke harness.
+#
+# Do not silently skip a blocked case. If a product bug prevents a case from
+# passing, add a tab-separated row here with the case name and the exact
+# reason, e.g.
+#
+#   approval_allow_creates	write_file is rejected by the permission engine; see docs/testing.md
+#
+# The harness prints XFAIL with the captured output paths and does not count
+# the case as a hard failure. Remove the row once the product bug is fixed.
