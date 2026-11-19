@@ -18,9 +18,6 @@ fn writeStdout(init: std.process.Init, bytes: []const u8) !void {
     var buf: [4096]u8 = undefined;
     var w = stdoutWriter(init, &buf);
     try w.interface.writeAll(bytes);
-    if (env.get("BLOOB_COMPAT_BASE_URL") != null) {
-        try w.interface.writeAll("  compat/*              OpenAI-compatible endpoint configured via BLOOB_COMPAT_BASE_URL\n");
-    }
     try w.interface.flush();
 }
 
@@ -53,10 +50,13 @@ fn listModels(init: std.process.Init) !void {
     } else {
         try w.interface.writeAll("  anthropic/*           unavailable: ANTHROPIC_API_KEY is not set\n");
     }
+    if (env.get("BLOOB_COMPAT_BASE_URL") != null) {
+        try w.interface.writeAll("  compat/*              OpenAI-compatible endpoint configured via BLOOB_COMPAT_BASE_URL\n");
+    }
     try w.interface.flush();
 }
 
-fn doctor(init: std.process.Init) !void {
+fn doctor(init: std.process.Init, cwd: []const u8) !void {
     var buf: [16384]u8 = undefined;
     var w = stdoutWriter(init, &buf);
     const is_tty = term.Terminal.isTty(std.posix.STDIN_FILENO) and term.Terminal.isTty(std.posix.STDOUT_FILENO);
@@ -91,7 +91,7 @@ fn doctor(init: std.process.Init) !void {
         if (is_tty) "yes" else "no",
         env.get("TERM") orelse "(unset)",
         env.get("COLORTERM") orelse "(unset)",
-        env.get("PWD") orelse ".",
+        cwd,
         cfg_path orelse "(none)",
         if (cfg_exists) "yes" else "no",
         data_path orelse "(unavailable)",
@@ -180,6 +180,15 @@ pub fn main(process_init: std.process.Init) !u8 {
     defer cli.deinit(process_init.gpa);
     var cwd_owned: ?[:0]u8 = null;
     defer if (cwd_owned) |p| process_init.gpa.free(p);
+    var model_owned: ?[]u8 = null;
+    defer if (model_owned) |m| process_init.gpa.free(m);
+    var effective_model = cli.model orelse "mock/fixture";
+    if (cli.provider) |p| {
+        if (std.mem.indexOfScalar(u8, effective_model, '/') == null) {
+            model_owned = std.fmt.allocPrint(process_init.gpa, "{s}/{s}", .{ p, effective_model }) catch null;
+            if (model_owned) |m| effective_model = m;
+        }
+    }
     const cwd = cli.cwd orelse blk: {
         cwd_owned = std.process.currentPathAlloc(process_init.io, process_init.gpa) catch null;
         break :blk if (cwd_owned) |p| p else ".";
@@ -215,7 +224,7 @@ pub fn main(process_init: std.process.Init) !u8 {
         return 0;
     }
     if (cli.doctor) {
-        try doctor(process_init);
+        try doctor(process_init, cwd);
         return 0;
     }
     if (cli.self_test) {
@@ -223,7 +232,7 @@ pub fn main(process_init: std.process.Init) !u8 {
         return 0;
     }
     if (cli.print) |prompt_arg| {
-        const model = cli.model orelse "mock/fixture";
+        const model = effective_model;
         var prompt_owned: ?[]u8 = null;
         defer if (prompt_owned) |p| process_init.gpa.free(p);
         var prompt = prompt_arg;
@@ -261,7 +270,7 @@ pub fn main(process_init: std.process.Init) !u8 {
     };
     defer terminal.deinit();
     var app = try app_mod.App.init(process_init.gpa, process_init.io, &terminal, .{
-        .model = cli.model,
+        .model = effective_model,
         .cwd = cwd,
     });
     defer app.deinit();

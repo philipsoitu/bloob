@@ -9,6 +9,7 @@ const providers = @import("providers/stream.zig");
 const registry = @import("providers/registry.zig");
 const request = @import("providers/request.zig");
 const prompts = @import("agent/prompts.zig");
+const text = @import("text.zig");
 
 pub const Options = struct {
     model: []const u8,
@@ -42,31 +43,37 @@ const Out = struct {
         try self.write(out.items);
     }
 
-    fn textDelta(self: *Out, text: []const u8) !void {
-        if (text.len == 0) return;
+    fn textDelta(self: *Out, raw: []const u8) !void {
+        if (raw.len == 0) return;
+        const safe = text.sanitizeAlloc(std.heap.page_allocator, raw, 64 * 1024) catch return;
+        defer std.heap.page_allocator.free(safe);
+        const cleaned = safe;
         if (self.json) {
             var out = std.ArrayList(u8).empty;
             defer out.deinit(std.heap.page_allocator);
             try out.appendSlice(std.heap.page_allocator, "{\"type\":\"text_delta\",\"text\":");
-            try appendJson(std.heap.page_allocator, &out, text);
+            try appendJson(std.heap.page_allocator, &out, cleaned);
             try out.appendSlice(std.heap.page_allocator, "}\n");
             try self.write(out.items);
         } else {
-            try self.write(text);
+            try self.write(cleaned);
             self.wrote_text = true;
         }
     }
 
-    fn eventText(self: *Out, text: []const u8) !void {
+    fn eventText(self: *Out, raw: []const u8) !void {
+        const safe = text.sanitizeAlloc(std.heap.page_allocator, raw, 64 * 1024) catch return;
+        defer std.heap.page_allocator.free(safe);
+        const cleaned = safe;
         if (self.json) {
             var out = std.ArrayList(u8).empty;
             defer out.deinit(std.heap.page_allocator);
             try out.appendSlice(std.heap.page_allocator, "{\"type\":\"text\",\"text\":");
-            try appendJson(std.heap.page_allocator, &out, text);
+            try appendJson(std.heap.page_allocator, &out, cleaned);
             try out.appendSlice(std.heap.page_allocator, "}\n");
             try self.write(out.items);
         } else {
-            try self.write(text);
+            try self.write(cleaned);
         }
     }
 
@@ -91,7 +98,9 @@ const Out = struct {
         try out.appendSlice(std.heap.page_allocator, ",\"is_error\":");
         try out.appendSlice(std.heap.page_allocator, if (is_error) "true" else "false");
         try out.appendSlice(std.heap.page_allocator, ",\"content\":");
-        try appendJson(std.heap.page_allocator, &out, content);
+        const safe = text.sanitizeAlloc(std.heap.page_allocator, content, 128 * 1024) catch content;
+        defer if (safe.ptr != content.ptr) std.heap.page_allocator.free(safe);
+        try appendJson(std.heap.page_allocator, &out, safe);
         try out.appendSlice(std.heap.page_allocator, "}\n");
         try self.write(out.items);
     }
@@ -164,9 +173,9 @@ pub fn run(init: std.Io, gpa: std.mem.Allocator, opts: Options) !void {
     _ = try conv.add(.user, opts.prompt, 0);
     if (registry.isMock(opts.model)) {
         try out.eventStart(opts.model);
-        const text = try std.fmt.allocPrint(gpa, "[mock/fixture — deterministic offline output; no model was contacted]\n\nDeterministic fixture response.\nprompt: {s}\n", .{opts.prompt});
-        defer gpa.free(text);
-        try out.eventText(text);
+        const cleaned = try std.fmt.allocPrint(gpa, "[mock/fixture — deterministic offline output; no model was contacted]\n\nDeterministic fixture response.\nprompt: {s}\n", .{opts.prompt});
+        defer gpa.free(cleaned);
+        try out.eventText(cleaned);
         try out.eventDone(.{});
         return;
     }

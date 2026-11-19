@@ -328,3 +328,25 @@ test "config loads and can require modules from config directory" {
     try std.testing.expectEqual(ui.Kind.column, layout.kind);
     try std.testing.expectEqualStrings("from-helper", layout.children[0].content.?);
 }
+
+test "lua model routing returns a model id" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var host = TestHost{};
+    defer host.notified.deinit(std.testing.allocator);
+    defer host.model.deinit(std.testing.allocator);
+    defer host.theme.deinit(std.testing.allocator);
+    const rt = try runtime_mod.Runtime.init(std.testing.allocator, io, host.host());
+    defer rt.deinit();
+    try rt.execString(
+        \\local models = require("bloob.models")
+        \\models.route(function(ctx)
+        \\  if ctx.task == "chat" then return "mock/routed" end
+        \\  return nil
+        \\end)
+    , "=models");
+    const routed = rt.routeModel("chat", "mock/original") orelse return error.NoRoute;
+    defer std.testing.allocator.free(routed);
+    try std.testing.expectEqualStrings("mock/routed", routed);
+}

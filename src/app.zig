@@ -720,6 +720,7 @@ pub const App = struct {
             self.beginToolLoop();
         } else {
             self.agent_phase = if (cancelled) .cancelled else .idle;
+            self.emitAgentEvent(if (cancelled) "agent.cancelled" else "agent.after_turn");
         }
         self.dirty = true;
     }
@@ -1694,11 +1695,13 @@ pub const App = struct {
         self.persistPendingMessages();
         if (err != null) {
             self.agent_phase = .failed;
+            self.emitAgentEvent("agent.error");
         } else if (had_tools) {
             self.agent_phase = .executing_tools;
             self.beginToolLoop();
         } else {
             self.agent_phase = .idle;
+            self.emitAgentEvent("agent.after_turn");
             if (self.lua) |l| {
                 const usage = self.conversation.totalUsage();
                 const payload = std.fmt.allocPrint(self.gpa, "{{\"prompt_tokens\":{d},\"completion_tokens\":{d},\"reported\":{s}}}", .{ usage.prompt_tokens, usage.completion_tokens, if (usage.reported) "true" else "false" }) catch null;
@@ -1727,6 +1730,7 @@ pub const App = struct {
         self.provider_emit_pos = 0;
         self.persistPendingMessages();
         self.agent_phase = .cancelled;
+        self.emitAgentEvent("agent.cancelled");
         self.dirty = true;
         return true;
     }
@@ -1907,7 +1911,9 @@ pub const App = struct {
                 self.setModel(args);
                 self.notify("Model selected", false);
             } else {
-                self.notify("Active model", false);
+                const msg = std.fmt.allocPrint(self.gpa, "Model: {s}", .{self.model}) catch "Model";
+                defer self.gpa.free(msg);
+                self.notify(msg, false);
             }
         } else if (std.mem.eql(u8, name, "providers")) {
             var buf = std.ArrayList(u8).empty;
@@ -2740,6 +2746,9 @@ pub const App = struct {
             for (self.context_files.items) |p| appendFmt(self.gpa, &buf, "  {s}\n", .{p}) catch {};
         }
         self.appendSystemMessage(buf.items);
+    }
+    fn emitAgentEvent(self: *App, name: []const u8) void {
+        if (self.lua) |l| _ = l.emit(name, "{}");
     }
     fn emitSessionEvent(self: *App, name: []const u8) void {
         const l = self.lua orelse return;

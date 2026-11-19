@@ -1,6 +1,6 @@
 # bloob implementation status
 
-_Last updated: 2026-11-18 (autonomous implementation session)._
+_Last updated: 2026-11-18 (later autonomous checkpoint)._
 
 ## Executive summary
 
@@ -14,6 +14,7 @@ bloob is now a runnable terminal coding agent:
 - Headless `--print`/`--json` with real streaming and a safe default-deny policy for approval-gated tools.
 - Durable append-only JSONL sessions, resume/list/delete, and incremental persistence of user/assistant/tool messages.
 - Basic trusted user-plugin loading from `$XDG_CONFIG_HOME/bloob/plugins/*/plugin.lua`, disabled by `--safe-mode`/`--no-config`.
+- Context file selection with bounded content injection, Markdown export, and async cancellable TUI shell execution.
 
 ## Milestone matrix
 
@@ -143,18 +144,19 @@ Manual checks:
 
 ## Known limitations / open bugs
 
-1. **Synchronous tool execution**: shell/search/git block the UI thread until
-   completion (bounded by timeouts/caps). Ctrl-C cannot interrupt a running
-   shell command yet.
+1. **Synchronous search/git (TUI)**: the interactive shell tool is async and
+   cancellable, but search/git still block the UI thread (bounded by caps).
+   Headless shell execution remains synchronous.
 2. **Hot reload is not fully transactional**: candidate config can register
    themes/run commands before swap. Theme/model are restored on failure, but
    custom theme registrations may remain. Plugin teardown is not implemented.
 3. **Anthropic live path untested** against a real key; parser/request tests
-   exist. OpenAI-compatible live path is verified.
+   and a fake Anthropic SSE integration exist. OpenAI-compatible live path is
+   verified.
 4. **No retry/backoff** for transient provider errors; no explicit overall
    stream deadline beyond curl `--max-time 300`.
-5. **No context compaction/token budget UI**; the system prompt contains the
-   workspace, but users cannot select context files yet.
+5. **No context compaction/token budget UI**: `/context` can add bounded files,
+   but there is no summarization or model-aware budget enforcement.
 6. **Key chords unsupported**: `<leader>x` specs are rejected instead of
    silently colliding. Modes are insert/normal/global only.
 7. **Visual selection/copy**, rich diff navigation and expandable tool output
@@ -165,14 +167,14 @@ Manual checks:
 10. **No subagents, strategies, MCP, LSP or Tree-sitter**.
 11. **Terminal restoration on panic** is not guaranteed (Zig abort does not
     unwind); normal errors and controlled exits restore.
-12. Linux-first: PTY harness uses util-linux `script`; shell tool expects
-    `timeout`/`/bin/sh`.
+12. Linux-first: PTY harness uses util-linux `script`; interactive shell uses
+    `/bin/sh` and an async job; headless shell uses coreutils `timeout`.
 13. Full-frame redraws only; no dirty-region diffing. Large conversations
     re-wrap each frame.
 14. Some OOM-only ownership paths still free-before-dupe in places outside the
     hot paths; normal behavior is covered by allocator tests.
-15. `--provider` is parsed but not combined into the model; normal
-    `--model provider/model` is the supported form.
+15. `--provider` combines into the model when the model lacks a slash; supported
+    forms are `--model provider/model` and `--provider P --model M`.
 
 ## Dependencies and versions
 
@@ -196,3 +198,38 @@ Manual checks:
    resume in the TUI.
 6. Add ANSI-injection, symlink-sensitive, shell-timeout, and approval-TOCTOU
    regression tests to the PTY harness.
+
+## Later-checkpoint evidence
+
+- Fake Anthropic SSE server: `--print --json --model anthropic/test-model`
+  produced normalized `text_delta` and reported usage (11 prompt / 4 completion).
+- Fake OpenAI-compatible SSE server and the real IBM ICA DeepSeek endpoint both
+  streamed normalized text and usage. Real API final check returned
+  `BLOOB_FINAL_API_OK`. A real `read_file` tool → result → second-response loop
+  completed in both headless and TUI modes.
+- Async TUI shell: `run printf ASYNC_SHELL_OK` with approval produced output and
+  a clean follow-up; `run sleep 5` + Ctrl-C appended `[command cancelled]` and
+  left the prompt usable.
+- Sessions: create → list (4 messages) → resume restored user + fixture
+  assistant text. Export wrote a Markdown transcript.
+- Plugins: user plugin `/plugin-hello` notified `PLUGIN_HELLO_OK`;
+  `--safe-mode`/`--no-config` skipped it.
+- Hot reload: A→B swap displayed B; invalid config retained A with
+  `Reload failed; previous configuration kept`.
+- Context: `/context add README.md` listed the file and injected bounded content.
+- `zig fmt --check build.zig src`, `zig build test`, `zig build smoke`,
+  `tests/pty_smoke.sh` (8/8), `examples/verify.lua` (7/7), and `--self-test`
+  all pass.
+
+## Exact next tasks
+
+1. Add PTY cases for async shell cancellation, hot reload rollback, sessions and
+   plugin loading (currently manual evidence).
+2. Make search/git async or worker-bounded; add provider retry/backoff and a hard
+   stream deadline.
+3. Make hot reload fully transactional (buffer candidate host effects) and add
+   plugin manifests/capabilities/setup/teardown.
+4. Add context compaction, token-budget enforcement, visual selection/copy and
+   richer diff navigation.
+5. Add session export JSON, retention/cleanup and cross-process locking.
+6. Run ReleaseSafe/ReleaseFast and a clean-home acceptance scenario.
