@@ -341,6 +341,60 @@ feed_approval() {
   sleep_ms 400
 }
 
+feed_shell_cancel() {
+  wait_for_text "$CASE_RAW" "Welcome to" || true
+  sleep_ms 150
+  printf "run sleep 5; printf 'SHELL''_DONE_OUTPUT'"
+  sleep_ms 150
+  printf '\023'
+  wait_for_text "$CASE_RAW" "Approval required" "$WAIT_MS" || true
+  sleep_ms 250
+  printf 'a'
+  wait_for_text "$CASE_RAW" "shell" "$WAIT_MS" || true
+  sleep_ms 700
+  printf '\003' # Ctrl-C cancels the async shell
+  wait_for_text "$CASE_RAW" "command cancelled" "$WAIT_MS" || true
+  sleep_ms 400
+  printf '\021'
+  sleep_ms 400
+}
+
+feed_reload() {
+  wait_for_text "$CASE_RAW" "RELOAD_A" "$WAIT_MS" || true
+  cp "$CASE_DIR/reload_b.lua" "$CASE_DIR/reload.lua"
+  sleep_ms 200
+  printf '\022' # Ctrl-R
+  wait_for_text "$CASE_RAW" "RELOAD_B" "$WAIT_MS" || true
+  sleep_ms 300
+  printf '\021'
+  sleep_ms 400
+}
+
+feed_session_first() {
+  wait_for_text "$CASE_RAW" "Welcome to" || true
+  sleep_ms 150
+  printf 'SESSION_PERSIST_TOKEN'
+  sleep_ms 150
+  printf '\023'
+  wait_for_text "$CASE_RAW" "SESSION_PERSIST_TOKEN" 6000 || true
+  wait_for_text "$CASE_RAW" "fixture provider" 6000 || true
+  sleep_ms 500
+  printf '\021'
+  sleep_ms 400
+}
+
+feed_plugin() {
+  wait_for_text "$CASE_RAW" "Welcome to" || true
+  sleep_ms 150
+  printf '/harness.plugin'
+  sleep_ms 150
+  printf '\023'
+  wait_for_text "$CASE_RAW" "PLUGIN_HARNESS_OK" "$WAIT_MS" || true
+  sleep_ms 300
+  printf '\021'
+  sleep_ms 400
+}
+
 feed_deny() {
   feed_approval d
 }
@@ -473,6 +527,71 @@ case_ctrl_c_cancels_stream() {
   end_case
 }
 
+case_async_shell_cancel() {
+  begin_case async_shell_cancel
+  pty_capture feed_shell_cancel "$BIN" --no-config --cwd ws
+  expect_exit 0
+  expect_text "approval modal" "$CASE_TXT" "Approval required"
+  expect_text "shell approval command" "$CASE_TXT" "sleep 5"
+  expect_text "shell cancelled result" "$CASE_TXT" "[command cancelled]"
+  expect_text "shell cancel notice" "$CASE_TXT" "Shell command cancelled"
+  expect_text_absent "shell was not allowed to finish" "$CASE_TXT" "SHELL_DONE_OUTPUT"
+  end_case
+}
+
+case_reload_swaps_layout() {
+  begin_case reload_swaps_layout
+  cat > "$CASE_DIR/reload.lua" <<'LUA'
+local ui = require("bloob.ui")
+ui.register("reload.marker", function() return ui.text("RELOAD_A") end)
+ui.set_layout(function()
+  return ui.column({ ui.row({ ui.chat({ flex = 1 }), ui.widget("reload.marker", { width = 20 }) }, { flex = 1 }), ui.input({ height = 6 }), ui.statusline() })
+end)
+LUA
+  cat > "$CASE_DIR/reload_b.lua" <<'LUA'
+local ui = require("bloob.ui")
+ui.register("reload.marker", function() return ui.text("RELOAD_B") end)
+ui.set_layout(function()
+  return ui.column({ ui.row({ ui.chat({ flex = 1 }), ui.widget("reload.marker", { width = 20 }) }, { flex = 1 }), ui.input({ height = 6 }), ui.statusline() })
+end)
+LUA
+  pty_capture feed_reload "$BIN" --config reload.lua --cwd ws
+  expect_exit 0
+  expect_text "initial layout" "$CASE_TXT" "RELOAD_A"
+  expect_text "reloaded layout" "$CASE_TXT" "RELOAD_B"
+  expect_text "reload notice" "$CASE_TXT" "Configuration reloaded"
+  end_case
+}
+
+case_session_resume() {
+  begin_case session_resume
+  pty_capture feed_session_first "$BIN" --no-config --cwd ws
+  expect_exit 0
+  expect_text "first user message" "$CASE_TXT" "SESSION_PERSIST_TOKEN"
+  pty_capture feed_quit_after_boot "$BIN" --no-config --cwd ws --resume
+  expect_exit 0
+  expect_text "resumed user message" "$CASE_TXT" "SESSION_PERSIST_TOKEN"
+  expect_text "resume notice" "$CASE_TXT" "Session resumed"
+  end_case
+}
+
+case_user_plugin_loads() {
+  begin_case user_plugin_loads
+  mkdir -p "$CASE_DIR/xdg/bloob/plugins/harness"
+  cat > "$CASE_DIR/xdg/bloob/plugins/harness/plugin.lua" <<'LUA'
+local bloob = require("bloob")
+bloob.command.register("harness.plugin", {
+  description = "Harness plugin command",
+  run = function(ctx) ctx:notify("PLUGIN_HARNESS_OK") end,
+})
+LUA
+  pty_capture feed_plugin "$BIN" --cwd ws
+  expect_exit 0
+  expect_text "plugin loaded notice" "$CASE_TXT" "Loaded 1 plugin"
+  expect_text "plugin command result" "$CASE_TXT" "PLUGIN_HARNESS_OK"
+  end_case
+}
+
 all_cases() {
   case_cold_boot_no_config
   case_ctrl_q_restore
@@ -482,6 +601,10 @@ all_cases() {
   case_approval_deny_unchanged
   case_approval_allow_creates
   case_ctrl_c_cancels_stream
+  case_async_shell_cancel
+  case_reload_swaps_layout
+  case_session_resume
+  case_user_plugin_loads
 }
 
 # ---------------------------------------------------------------------------

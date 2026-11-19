@@ -85,6 +85,10 @@ No API keys are required. The right side of the pipeline explicitly unsets
 | `approval_deny_unchanged` | A fixture `write_file` proposal shows the approval modal; denying it (`d`) leaves a pre-existing file byte-for-byte unchanged. |
 | `approval_allow_creates` | The same proposal allowed once (`a`) creates the file with the fixture content. |
 | `ctrl_c_cancels_stream` | Ctrl-C during a fixture stream appends the cancellation marker, sets the cancelled state, reports `Request cancelled`, and exits cleanly. |
+| `async_shell_cancel` | Approves a `sleep 5` shell tool, Ctrl-C cancels the async job, `[command cancelled]` is shown, the command output never appears, and the prompt returns. |
+| `reload_swaps_layout` | Ctrl-R re-executes a changed `init.lua`; a registered marker changes A→B and the reload notice appears. |
+| `session_resume` | A session message is persisted; a second launch with `--resume` restores it and reports `Session resumed`. |
+| `user_plugin_loads` | A user plugin under `$XDG_CONFIG_HOME/bloob/plugins` registers a command; invoking it shows the plugin notification. |
 
 Fixtures:
 
@@ -198,12 +202,12 @@ bloob PTY smoke harness
 [PASS]  approval_allow_creates
 [PASS]  ctrl_c_cancels_stream
 
-Summary: 8 passed, 0 failed, 0 expected-fail, 0 unexpected-pass (of 8)
+Summary: 12 passed, 0 failed, 0 expected-fail, 0 unexpected-pass (of 12)
 ```
 
 The harness was also run three additional consecutive times with
-`BLOOB_PTY_SKIP_BUILD=1` (8/8 each) and once with
-`BLOOB_TEST_SCALE_MS=2000` (8/8). No product bug required an expected-failure
+`BLOOB_PTY_SKIP_BUILD=1` (12/12 each) and once with
+`BLOOB_TEST_SCALE_MS=2000` (12/12). No product bug required an expected-failure
 entry.
 
 ## 9. Adding a case

@@ -41,7 +41,7 @@ nix develop -c zig build              # success
 nix develop -c zig build test         # success (30+ unit/integration tests)
 nix develop -c zig build smoke        # success, ANSI-free fixture
 nix develop -c zig build smoke-json   # success, JSON events
-nix develop -c tests/pty_smoke.sh     # 8/8 passing
+nix develop -c tests/pty_smoke.sh     # 12/12 passing
 nix develop -c luajit examples/verify.lua  # 7/7 examples pass with stubbed bridge
 ./zig-out/bin/bloob --self-test       # OK (root=column, children=3, 100x30)
 ./zig-out/bin/bloob --doctor          # reports terminal/config/data/key presence
@@ -218,7 +218,7 @@ Manual checks:
   `Reload failed; previous configuration kept`.
 - Context: `/context add README.md` listed the file and injected bounded content.
 - `zig fmt --check build.zig src`, `zig build test`, `zig build smoke`,
-  `tests/pty_smoke.sh` (8/8), `examples/verify.lua` (7/7), and `--self-test`
+  `tests/pty_smoke.sh` (12/12), `examples/verify.lua` (7/7), and `--self-test`
   all pass.
 
 ## Exact next tasks
