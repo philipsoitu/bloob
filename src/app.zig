@@ -1033,7 +1033,9 @@ pub const App = struct {
         var prev = tools.preview(ctx, call.name, call.args);
         defer prev.deinit(self.gpa);
         var cap: permissions.Capability = .custom;
-        if (tools.findDef(call.name)) |def| cap = def.capability;
+        if (tools.findDef(call.name)) |def| cap = def.capability else if (self.lua) |l| {
+            if (l.toolByName(call.name)) |lt| cap = luaToolCapability(self.gpa, lt.permissions);
+        }
         var decision = self.permission_engine.evaluate(.{
             .tool = call.name,
             .capability = cap,
@@ -2173,7 +2175,10 @@ fn hostReload(ctx: *anyopaque) void {
 }
 fn hostReadFile(ctx: *anyopaque, path: []const u8, out: *?[]u8) bool {
     const self: *App = @ptrCast(@alignCast(ctx));
-    const data = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.gpa, .limited(256 * 1024)) catch return false;
+    const ws = if (self.workspace) |*w| w else return false;
+    const abs = ws.resolveRead(path) catch return false;
+    defer self.gpa.free(abs);
+    const data = std.Io.Dir.cwd().readFileAlloc(self.io, abs, self.gpa, .limited(256 * 1024)) catch return false;
     out.* = data;
     return true;
 }
@@ -2200,4 +2205,27 @@ pub fn appendJsonStringPublic(gpa: std.mem.Allocator, out: *std.ArrayList(u8), s
         }
     }
     try out.append(gpa, '"');
+}
+
+fn luaToolCapability(gpa: std.mem.Allocator, permissions_json: []const u8) permissions.Capability {
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, permissions_json, .{}) catch return .custom;
+    defer parsed.deinit();
+    const arr = switch (parsed.value) {
+        .array => |a| a,
+        else => return .custom,
+    };
+    var saw_write = false;
+    var saw_shell = false;
+    var saw_read = false;
+    for (arr.items) |v| {
+        if (v != .string) continue;
+        const s = v.string;
+        if (std.mem.indexOf(u8, s, "workspace.write") != null) saw_write = true;
+        if (std.mem.indexOf(u8, s, "shell") != null) saw_shell = true;
+        if (std.mem.indexOf(u8, s, "read") != null) saw_read = true;
+    }
+    if (saw_write) return .workspace_write;
+    if (saw_shell) return .shell;
+    if (saw_read) return .workspace_read;
+    return .custom;
 }

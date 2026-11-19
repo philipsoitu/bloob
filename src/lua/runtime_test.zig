@@ -193,3 +193,32 @@ test "bad layout returns an error instead of crashing" {
     defer arena_inst.deinit();
     try std.testing.expectError(error.UnknownNodeKind, rt.buildLayout(arena_inst.allocator(), .{}));
 }
+
+test "lua custom tool registration and ctx read_file" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var host = TestHost{};
+    defer host.notified.deinit(std.testing.allocator);
+    defer host.model.deinit(std.testing.allocator);
+    defer host.theme.deinit(std.testing.allocator);
+    const rt = try runtime_mod.Runtime.init(std.testing.allocator, io, host.host());
+    defer rt.deinit();
+    try rt.execString(
+        \\local tools = require("bloob.tools")
+        \\tools.register("echo_path", {
+        \\  description = "Echo a path through ctx:read_file",
+        \\  schema = { type = "object", properties = { path = { type = "string" } }, required = { "path" } },
+        \\  permissions = { "workspace.read" },
+        \\  run = function(ctx, args)
+        \\    local content = ctx:read_file(args.path)
+        \\    return { path = args.path, content = content }
+        \\  end,
+        \\})
+    , "=tool");
+    const tool = rt.toolByName("echo_path") orelse return error.MissingTool;
+    const out = rt.invokeTool(tool, "{\"path\":\"src/main.zig\"}") orelse return error.ToolFailed;
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"path\":\"src/main.zig\"") != null);
+    try std.testing.expect(rt.tools.items.len == 1);
+}

@@ -462,6 +462,9 @@ pub const Runtime = struct {
         // agents is intentionally an empty read-only-shaped list for now.
         util.newTable(L);
         lua.lua_setfield(L, -2, "agents");
+        installFn(L, self, -1, "notify", c_ctx_notify);
+        installFn(L, self, -1, "read_file", c_ctx_read_file);
+        installFn(L, self, -1, "command", c_ctx_command);
     }
 
     pub fn buildLayout(self: *Runtime, arena: std.mem.Allocator, ctx: WidgetContext) !*ui.Node {
@@ -638,7 +641,11 @@ pub const Runtime = struct {
         pushJsonValue(L, parsed.value) catch {
             util.newTable(L);
         };
-        util.pcall(L, 2, 1, null, self.gpa) catch return null;
+        var errbuf = std.ArrayList(u8).empty;
+        defer errbuf.deinit(self.gpa);
+        util.pcall(L, 2, 1, &errbuf, self.gpa) catch {
+            return null;
+        };
         return luaToJson(self.gpa, L, -1);
     }
 
@@ -818,7 +825,7 @@ pub const Runtime = struct {
 
     fn c_notify(L: ?*lua.lua_State) callconv(.c) c_int {
         const l = L orelse return 0;
-        const rt = selfFromUpvalue(l);
+        const rt = selfFromUpvalueFree(l);
         const msg = util.getString(l, 1) orelse return 0;
         const is_error = util.getBool(l, 2);
         const owned = rt.gpa.dupe(u8, msg) catch return 0;
@@ -829,7 +836,7 @@ pub const Runtime = struct {
 
     fn c_quit(L: ?*lua.lua_State) callconv(.c) c_int {
         const l = L orelse return 0;
-        const rt = selfFromUpvalue(l);
+        const rt = selfFromUpvalueFree(l);
         rt.host.quit(rt.host.ctx);
         return 0;
     }
@@ -842,14 +849,14 @@ pub const Runtime = struct {
 
     fn c_request_reload(L: ?*lua.lua_State) callconv(.c) c_int {
         const l = L orelse return 0;
-        const rt = selfFromUpvalue(l);
+        const rt = selfFromUpvalueFree(l);
         rt.host.request_reload(rt.host.ctx);
         return 0;
     }
 
     fn c_set_model(L: ?*lua.lua_State) callconv(.c) c_int {
         const l = L orelse return 0;
-        const rt = selfFromUpvalue(l);
+        const rt = selfFromUpvalueFree(l);
         const model = util.getString(l, 1) orelse return 0;
         const owned = rt.gpa.dupe(u8, model) catch return 0;
         defer rt.gpa.free(owned);
@@ -873,7 +880,7 @@ pub const Runtime = struct {
 
     fn c_run_command(L: ?*lua.lua_State) callconv(.c) c_int {
         const l = L orelse return 0;
-        const rt = selfFromUpvalue(l);
+        const rt = selfFromUpvalueFree(l);
         const name = util.getString(l, 1) orelse return 0;
         const args = util.getString(l, 2) orelse "";
         const name_owned = rt.gpa.dupe(u8, name) catch return 0;
@@ -907,7 +914,7 @@ pub const Runtime = struct {
 
     fn c_config_sources(L: ?*lua.lua_State) callconv(.c) c_int {
         const l = L orelse return 0;
-        const rt = selfFromUpvalue(l);
+        const rt = selfFromUpvalueFree(l);
         util.newTable(l);
         for (rt.config_sources.items, 0..) |s, i| {
             util.pushString(l, s);
@@ -918,7 +925,7 @@ pub const Runtime = struct {
 
     fn c_register_command(L: ?*lua.lua_State) callconv(.c) c_int {
         const l = L orelse return 0;
-        const rt = selfFromUpvalue(l);
+        const rt = selfFromUpvalueFree(l);
         const name = util.getString(l, 1) orelse return 0;
         const desc = util.getString(l, 2) orelse "";
         const name_owned = rt.gpa.dupe(u8, name) catch return 0;
@@ -944,7 +951,7 @@ pub const Runtime = struct {
 
     fn c_ui_set_layout(L: ?*lua.lua_State) callconv(.c) c_int {
         const l = L orelse return 0;
-        const rt = selfFromUpvalue(l);
+        const rt = selfFromUpvalueFree(l);
         if (!util.isTable(l, 1) and !util.isFunction(l, 1)) {
             lua.lua_pushstring(l, "ui.set_layout expects a node table or function");
             _ = lua.lua_error(l);
@@ -999,7 +1006,7 @@ pub const Runtime = struct {
 
     fn c_ui_theme_register(L: ?*lua.lua_State) callconv(.c) c_int {
         const l = L orelse return 0;
-        const rt = selfFromUpvalue(l);
+        const rt = selfFromUpvalueFree(l);
         const name = util.getString(l, 1) orelse return 0;
         const palette = parsePalette(l, 2);
         rt.host.register_theme(rt.host.ctx, name, &palette);
@@ -1008,7 +1015,7 @@ pub const Runtime = struct {
 
     fn c_ui_theme_set(L: ?*lua.lua_State) callconv(.c) c_int {
         const l = L orelse return 0;
-        const rt = selfFromUpvalue(l);
+        const rt = selfFromUpvalueFree(l);
         const name = util.getString(l, 1) orelse return 0;
         rt.host.set_theme(rt.host.ctx, name);
         return 0;
@@ -1023,7 +1030,7 @@ pub const Runtime = struct {
 
     fn keymapSet(L: ?*lua.lua_State, is_command: bool) c_int {
         const l = L orelse return 0;
-        const rt = selfFromUpvalue(l);
+        const rt = selfFromUpvalueFree(l);
         const mode = util.getString(l, 1) orelse return 0;
         const lhs = util.getString(l, 2) orelse return 0;
         const desc = util.getString(l, 4) orelse "";
@@ -1077,7 +1084,7 @@ pub const Runtime = struct {
 
     fn c_keymap_del(L: ?*lua.lua_State) callconv(.c) c_int {
         const l = L orelse return 0;
-        const rt = selfFromUpvalue(l);
+        const rt = selfFromUpvalueFree(l);
         const mode = util.getString(l, 1) orelse return 0;
         const lhs = util.getString(l, 2) orelse return 0;
         var i: usize = 0;
@@ -1105,7 +1112,7 @@ pub const Runtime = struct {
 
     fn c_keymap_leader(L: ?*lua.lua_State) callconv(.c) c_int {
         const l = L orelse return 0;
-        const rt = selfFromUpvalue(l);
+        const rt = selfFromUpvalueFree(l);
         if (util.getString(l, 1)) |s| {
             const d = @import("../text.zig").decode(s, 0);
             if (d.len > 0) rt.leader = d.cp;
@@ -1117,7 +1124,7 @@ pub const Runtime = struct {
 
     fn c_tool_register(L: ?*lua.lua_State) callconv(.c) c_int {
         const l = L orelse return 0;
-        const rt = selfFromUpvalue(l);
+        const rt = selfFromUpvalueFree(l);
         if (!util.isTable(l, 1)) return 0;
         const name = util.fieldString(l, 1, "name") orelse return 0;
         const desc = util.fieldString(l, 1, "description") orelse "";
@@ -1161,7 +1168,7 @@ pub const Runtime = struct {
 
     fn c_tool_list(L: ?*lua.lua_State) callconv(.c) c_int {
         const l = L orelse return 0;
-        const rt = selfFromUpvalue(l);
+        const rt = selfFromUpvalueFree(l);
         util.newTable(l);
         for (rt.tools.items, 0..) |t, i| {
             util.newTable(l);
@@ -1175,7 +1182,7 @@ pub const Runtime = struct {
 
     fn c_model_set_route(L: ?*lua.lua_State) callconv(.c) c_int {
         const l = L orelse return 0;
-        const rt = selfFromUpvalue(l);
+        const rt = selfFromUpvalueFree(l);
         if (!util.isFunction(l, 1)) return 0;
         lua.lua_pushvalue(l, 1);
         if (rt.route_ref >= 0) util.unref(l, rt.route_ref);
@@ -1185,7 +1192,7 @@ pub const Runtime = struct {
 
     fn c_read_file(L: ?*lua.lua_State) callconv(.c) c_int {
         const l = L orelse return 0;
-        const rt = selfFromUpvalue(l);
+        const rt = selfFromUpvalueFree(l);
         const path = util.getString(l, 1) orelse return 0;
         var out: ?[]u8 = null;
         const ok = rt.host.read_file(rt.host.ctx, path, &out);
@@ -1219,8 +1226,9 @@ fn pushJsonValue(L: util.State, value: std.json.Value) !void {
             util.newTable(L);
             var it = obj.iterator();
             while (it.next()) |entry| {
+                util.pushString(L, entry.key_ptr.*);
                 try pushJsonValue(L, entry.value_ptr.*);
-                lua.lua_setfield(L, -2, entry.key_ptr.*.ptr);
+                lua.lua_settable(L, -3);
             }
         },
     }
@@ -1228,7 +1236,8 @@ fn pushJsonValue(L: util.State, value: std.json.Value) !void {
 
 fn luaToJson(gpa: std.mem.Allocator, L: util.State, idx: c_int) ?[]u8 {
     var out = std.ArrayList(u8).empty;
-    serializeLua(gpa, L, idx, &out, 0) catch {
+    serializeLua(gpa, L, idx, &out, 0) catch |err| {
+        std.debug.print("serialize error: {s} top={d}\n", .{ @errorName(err), util.top(L) });
         out.deinit(gpa);
         return null;
     };
@@ -1264,16 +1273,16 @@ fn serializeLua(gpa: std.mem.Allocator, L: util.State, idx: c_int, out: *std.Arr
                 while (i < n) : (i += 1) {
                     if (i > 0) try out.append(gpa, ',');
                     util.rawGet(L, abs, @intCast(i + 1));
-                    defer util.pop(L, 1);
                     try serializeLua(gpa, L, -1, out, depth + 1);
+                    util.pop(L, 1);
                 }
                 try out.append(gpa, ']');
             } else {
                 try out.append(gpa, '{');
                 var first = true;
                 lua.lua_pushnil(L);
-                while (lua.lua_next(L, abs) != 0) {
-                    defer util.pop(L, 1);
+                while (true) {
+                    if (lua.lua_next(L, abs) == 0) break;
                     if (!first) try out.append(gpa, ',');
                     first = false;
                     if (util.getString(L, -2)) |key| {
@@ -1283,6 +1292,7 @@ fn serializeLua(gpa: std.mem.Allocator, L: util.State, idx: c_int, out: *std.Arr
                     }
                     try out.append(gpa, ':');
                     try serializeLua(gpa, L, -1, out, depth + 1);
+                    util.pop(L, 1);
                 }
                 try out.append(gpa, '}');
             }
@@ -1323,4 +1333,52 @@ fn appendJsonString(gpa: std.mem.Allocator, out: *std.ArrayList(u8), s: []const 
         }
     }
     try out.append(gpa, '"');
+}
+
+fn c_ctx_notify(L: ?*lua.lua_State) callconv(.c) c_int {
+    const l = L orelse return 0;
+    const rt = selfFromUpvalueFree(l);
+    // ctx:notify(msg[, opts]) => arg 2 is the message.
+    const msg = util.getString(l, 2) orelse return 0;
+    const is_error = util.getBool(l, 3);
+    const owned = rt.gpa.dupe(u8, msg) catch return 0;
+    defer rt.gpa.free(owned);
+    rt.host.notifyFn(owned, is_error);
+    return 0;
+}
+
+fn c_ctx_command(L: ?*lua.lua_State) callconv(.c) c_int {
+    const l = L orelse return 0;
+    const rt = selfFromUpvalueFree(l);
+    const name = util.getString(l, 2) orelse return 0;
+    const args = util.getString(l, 3) orelse "";
+    const n = rt.gpa.dupe(u8, name) catch return 0;
+    defer rt.gpa.free(n);
+    const a = rt.gpa.dupe(u8, args) catch return 0;
+    defer rt.gpa.free(a);
+    rt.host.run_command(rt.host.ctx, n, a);
+    return 0;
+}
+
+fn c_ctx_read_file(L: ?*lua.lua_State) callconv(.c) c_int {
+    const l = L orelse return 0;
+    const rt = selfFromUpvalueFree(l);
+    const path = util.getString(l, 2) orelse {
+        lua.lua_pushnil(l);
+        util.pushString(l, "path required");
+        return 2;
+    };
+    var out: ?[]u8 = null;
+    if (!rt.host.read_file(rt.host.ctx, path, &out) or out == null) {
+        lua.lua_pushnil(l);
+        util.pushString(l, "read denied or failed (workspace policy)");
+        return 2;
+    }
+    defer rt.gpa.free(out.?);
+    util.pushString(l, out.?);
+    return 1;
+}
+
+fn selfFromUpvalueFree(L: util.State) *Runtime {
+    return Runtime.selfFromUpvalue(L);
 }
