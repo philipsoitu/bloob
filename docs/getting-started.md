@@ -185,7 +185,7 @@ current directory. Use an absolute path to avoid surprises.
 headless runner that does not create the Lua runtime. Model selection still
 comes from `--model`/`BLOOB_*` environment variables.
 
-**Real providers do not work in `--print`.** Real streaming providers work in
+**Real providers in `--print`.** Real streaming providers work in
 headless mode when their API key (or compatible base URL) is configured; the
 fixture provider remains the zero-credential default.
 
