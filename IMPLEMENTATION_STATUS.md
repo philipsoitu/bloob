@@ -23,7 +23,7 @@ bloob is now a runnable terminal coding agent:
 | M0 bootstrap/verified deps | complete | Zig 0.17.1 pinned; LuaJIT 2.1 via pkg-config; `addTranslateC` because 0.17 removed `@cImport`. |
 | M1 responsive TUI/offline model | complete | Native backend, cell grid, layout, editor, chat, status, help, palette, fixture streaming, PTY tests. |
 | M2 real provider + agent core | mostly complete | Real streaming + tool-call parsing; retries/timeouts partially; headless real provider works. Anthropic parser implemented but not live-tested. |
-| M3 tools/safety/diffs/approvals | complete for core tools | read/list/search/write/edit/shell/git; diff preview; deny leaves files unchanged (PTY test). Shell runs synchronously. |
+| M3 tools/safety/diffs/approvals | complete for core tools | read/list/search/write/edit/shell/git; diff preview; deny leaves files unchanged (PTY test). Interactive shell is async/cancellable; headless shell is synchronous. |
 | M4 embedded Lua/config/API | complete for core | State lifecycle, protected calls/tracebacks, config discovery, modules, tests, hot reload. |
 | M5 composable Lua TUI | complete | Layout replacement, widget registry, signals, buttons/mouse, custom widget errors, examples, PTY layout test. |
 | M6 sessions/palette/plugins | partial | Sessions complete; palette/slash commands complete for core; user plugin loading basic; no manifests/teardown/version negotiation yet. |
@@ -175,6 +175,9 @@ Manual checks:
     hot paths; normal behavior is covered by allocator tests.
 15. `--provider` combines into the model when the model lacks a slash; supported
     forms are `--model provider/model` and `--provider P --model M`.
+16. Approval diff previews are not pinned to the file bytes executed later
+    (TOCTOU). edit_file re-checks unique old_text at execution, but a concurrent
+    change that still satisfies the match could be applied.
 
 ## Dependencies and versions
 
