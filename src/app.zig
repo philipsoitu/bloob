@@ -1102,6 +1102,10 @@ pub const App = struct {
         }
         const value = try self.editor.submit();
         defer self.gpa.free(value);
+        try self.submitValue(value);
+    }
+
+    pub fn submitValue(self: *App, value: []const u8) !void {
         if (value.len == 0) return;
         if (value[0] == '/') {
             try self.runSlash(value);
@@ -2661,7 +2665,11 @@ pub const App = struct {
                 self.notify(msg, true);
                 continue;
             };
-            self.plugins_loaded.append(self.gpa, self.gpa.dupe(u8, entry.name) catch continue) catch continue;
+            const owned = self.gpa.dupe(u8, entry.name) catch continue;
+            self.plugins_loaded.append(self.gpa, owned) catch {
+                self.gpa.free(owned);
+                continue;
+            };
             loaded += 1;
         }
         if (loaded > 0) {
@@ -2712,7 +2720,8 @@ pub const App = struct {
                     return;
                 }
             }
-            self.context_files.append(self.gpa, self.gpa.dupe(u8, rel) catch return) catch return;
+            const owned = self.gpa.dupe(u8, rel) catch return;
+            self.context_files.append(self.gpa, owned) catch self.gpa.free(owned);
             self.notify("Added file to context", false);
             return;
         }

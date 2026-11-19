@@ -276,6 +276,19 @@ pub fn main(process_init: std.process.Init) !u8 {
     defer app.deinit();
     app.initLua(cli.config, cli.no_config, cli.safe_mode);
     app.initSessions(cli.session, cli.resume_session);
+    if (cli.args.items.len > 0) {
+        var parts = std.ArrayList(u8).empty;
+        defer parts.deinit(process_init.gpa);
+        for (cli.args.items, 0..) |part, idx| {
+            if (idx > 0) try parts.append(process_init.gpa, ' ');
+            try parts.appendSlice(process_init.gpa, part);
+        }
+        app.submitValue(parts.items) catch |err| {
+            const msg = std.fmt.allocPrint(process_init.gpa, "initial prompt failed: {s}", .{@errorName(err)}) catch "initial prompt failed";
+            defer process_init.gpa.free(msg);
+            app.notify(msg, true);
+        };
+    }
     app.run() catch |err| {
         terminal.deinit();
         var buf: [4096]u8 = undefined;

@@ -82,3 +82,17 @@ nix develop -c tests/pty_smoke.sh
 nix develop -c luajit examples/verify.lua
 ./zig-out/bin/bloob --self-test
 ```
+
+## Documentation
+
+- [Getting started](docs/getting-started.md)
+- [Configuration](docs/configuration.md)
+- [Lua API](docs/lua-api.md)
+- [UI components](docs/ui-components.md)
+- [Keymaps](docs/keymaps.md)
+- [Events](docs/events.md)
+- [Plugins](docs/plugins.md)
+- [Sessions](docs/sessions.md)
+- [Security](docs/security.md)
+- [Testing](docs/testing.md)
+- [Troubleshooting](docs/troubleshooting.md)

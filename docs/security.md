@@ -196,3 +196,14 @@ traffic.
 - Use `reset`/`stty sane` if a crash leaves the terminal unusable.
 - Re-check this document before relying on a security property; the permission
   and plugin layers are still under active implementation.
+
+## Process isolation limits
+
+- The interactive shell tool spawns `/bin/sh -c COMMAND` with a hard deadline,
+  bounded output and a nonblocking pipe. Ctrl-C kills the direct shell child.
+  It does **not** create an OS process group or container, so descendants may
+  survive in unusual cases. Treat shell approval as powerful.
+- Headless shell execution uses coreutils `timeout --kill-after=5s` around
+  `/bin/sh -c`; descendants inherit the same limitation.
+- Search/git tools execute fixed external argv (no shell interpolation) but are
+  synchronous in the TUI. They have bounded capture sizes.

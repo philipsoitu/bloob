@@ -53,6 +53,14 @@ pub const Accumulator = struct {
         return &self.tool_calls.items[index];
     }
 
+    pub fn addText(self: *Accumulator, bytes: []const u8) void {
+        if (self.text.items.len + bytes.len > 16 * 1024 * 1024) {
+            self.setError("provider response text exceeds 16 MiB");
+            return;
+        }
+        self.text.appendSlice(self.gpa, bytes) catch {};
+    }
+
     pub fn setFinish(self: *Accumulator, reason: []const u8) void {
         if (reason.len == 0) return;
         if (self.finish_reason.len > 0) self.gpa.free(self.finish_reason);
@@ -374,7 +382,7 @@ pub const Stream = struct {
             .object => |o| o,
             else => return,
         };
-        if (jsonString(delta, "content")) |c| self.acc.text.appendSlice(self.gpa, c) catch {};
+        if (jsonString(delta, "content")) |c| self.acc.addText(c);
         const tcs = switch (delta.get("tool_calls") orelse return) {
             .array => |a| a,
             else => return,
@@ -389,7 +397,9 @@ pub const Stream = struct {
                 if (fv == .object) {
                     const fn_obj = fv.object;
                     if (jsonString(fn_obj, "name")) |nv| partial.name.appendSlice(self.gpa, nv) catch {};
-                    if (jsonString(fn_obj, "arguments")) |av| partial.args.appendSlice(self.gpa, av) catch {};
+                    if (jsonString(fn_obj, "arguments")) |av| {
+                        if (partial.args.items.len + av.len <= 1024 * 1024) partial.args.appendSlice(self.gpa, av) catch {} else self.acc.setError("tool arguments exceed 1 MiB");
+                    }
                 }
             }
         }
@@ -444,10 +454,12 @@ pub const Stream = struct {
                     const d = dv.object;
                     const dt = jsonString(d, "type") orelse "";
                     if (std.mem.eql(u8, dt, "text_delta")) {
-                        if (jsonString(d, "text")) |v| self.acc.text.appendSlice(self.gpa, v) catch {};
+                        if (jsonString(d, "text")) |v| self.acc.addText(v);
                     } else if (std.mem.eql(u8, dt, "input_json_delta")) {
                         const p = self.acc.ensureTool(idx) catch return;
-                        if (jsonString(d, "partial_json")) |v| p.args.appendSlice(self.gpa, v) catch {};
+                        if (jsonString(d, "partial_json")) |v| {
+                            if (p.args.items.len + v.len <= 1024 * 1024) p.args.appendSlice(self.gpa, v) catch {} else self.acc.setError("tool arguments exceed 1 MiB");
+                        }
                     }
                 }
             }
