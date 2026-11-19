@@ -27,6 +27,7 @@ pub const Kind = enum {
     tabs,
     overlay,
     custom,
+    widget,
 };
 
 pub const Dim = union(enum) {
@@ -191,7 +192,7 @@ pub fn intrinsicWidth(node: *const Node, available: u16, depth: usize) u16 {
             w +|= node.padding * 2;
             break :blk w;
         },
-        .custom => 0,
+        .custom, .widget => 0,
     };
 }
 
@@ -249,7 +250,7 @@ pub fn intrinsicHeight(node: *const Node, available: u16, depth: usize) u16 {
             h +|= node.padding * 2;
             break :blk h;
         },
-        .custom => 0,
+        .custom, .widget => 0,
     };
 }
 

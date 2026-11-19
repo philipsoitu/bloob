@@ -220,6 +220,7 @@ pub fn main(process_init: std.process.Init) !u8 {
         .cwd = cli.cwd orelse (env.get("PWD") orelse "."),
     });
     defer app.deinit();
+    app.initLua(cli.config, cli.no_config);
     app.run() catch |err| {
         terminal.deinit();
         var buf: [4096]u8 = undefined;
