@@ -23,12 +23,18 @@ Every redraw builds a short-lived declarative node tree in an arena, solves layo
 
 ## ADR-004: Lua callbacks and state ownership
 
-There is one Lua state owned by the UI thread. Lua layout/component callbacks run only during rendering. Registry references (`luaL_ref`) hold callbacks; until the Lua runtime milestone is integrated, no Lua state exists. Callbacks will be protected with `lua_pcall` and traceback handlers. Hot reload will build a candidate state and atomically swap it only after successful validation.
+There is one Lua state owned by the UI thread. Lua layout/component callbacks run only during rendering. Registry references (`luaL_ref`) hold callbacks. Callbacks are protected with `lua_pcall` and traceback handlers. Hot reload builds a candidate state and atomically swaps it only after successful config loading and layout validation.
+
+**Current status:** the runtime, bundled modules, declarative UI conversion, custom widgets, keymaps, events, Lua tools and hot reload are implemented. There is still no async Lua API, plugin loader or storage layer.
 
 ## ADR-005: Security boundary is Zig
 
-The permission engine, workspace path checks and approval decisions live in Zig. Lua hooks may tighten policy or request approval, never override an explicit Zig denial. Project-local Lua is disabled by default. LuaJIT FFI is not treated as a sandbox; user configuration is trusted, third-party/project plugins require explicit trust.
+The permission engine, workspace path checks and approval decisions live in Zig. Lua hooks may tighten policy or request approval, never override an explicit Zig denial. Project-local Lua is never loaded implicitly in the current build. LuaJIT FFI is not treated as a sandbox; user configuration is trusted, and third-party/project plugin loading is not implemented.
+
+**Current status:** native tools use the Zig policy and approval modal; `tool.before_execute` hooks can deny or escalate to ask. `--safe-mode` is parsed but not enforced, and Lua tool `permissions` metadata is not enforced yet. See `docs/security.md`.
 
 ## ADR-006: Providers via a streaming transport abstraction
 
-The agent core will define normalized stream events. The offline `mock/fixture` provider is deterministic and always available. Real providers are implemented behind the same interface. If curl is used as a transport in the first real provider slice, it is launched with fixed argv (no shell) and its output is parsed as SSE; this tradeoff will be documented and can later be replaced by `std.http` without touching the agent interface.
+The agent core defines normalized stream events. The offline `mock/fixture` provider is deterministic and always available. Real providers are implemented behind the same interface. The first real provider transport uses curl, launched with fixed argv (no shell), and parses its output as SSE; this can later be replaced by `std.http` without touching the agent interface.
+
+**Current status:** interactive OpenAI, Anthropic and OpenAI-compatible streaming exist. Headless `--print` remains fixture-only and does not load the Lua runtime.
