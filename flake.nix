@@ -26,6 +26,10 @@
 
             pkgs.luajit
             pkgs.lua-language-server
+            pkgs.git
+            pkgs.ripgrep
+            pkgs.fd
+            pkgs.curl
           ];
         };
       }

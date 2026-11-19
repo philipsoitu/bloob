@@ -1,0 +1,21 @@
+.{
+    .name = .bloob,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.1",
+    .fingerprint = 0x5672608a56bafb8c,
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "runtime",
+        "examples",
+        "tests",
+        "docs",
+        "README.md",
+        "IMPLEMENTATION_STATUS.md",
+        "flake.nix",
+        "flake.lock",
+        "plan.md",
+    },
+}
